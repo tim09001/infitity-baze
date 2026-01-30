@@ -1,0 +1,4 @@
+telethon==1.37.6
+sqlite3
+requests
+python-dotenv
