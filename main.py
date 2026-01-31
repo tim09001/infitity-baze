@@ -47,7 +47,7 @@ LOG_CHANNEL = 'https://t.me/+cnym32Oi-mJiMGNi'  # Ссылка на канал �
 OWNER_ID = [262511724]
 
 # Добавьте после других глобальных переменных
-APPEAL_CHAT_ID = -1003516817505  # Замените на реальный ID чата для апелляций
+APPEAL_CHAT_ID = -1003808268065  # Замените на реальный ID чата для апелляций
 
 class Database:
     def __init__(self, db_name='Ice.db'):
@@ -2066,7 +2066,7 @@ async def handle_appeal_text(event):
             )
 
             # ID группы апелляций (ЗАМЕНИТЕ НА РЕАЛЬНЫЙ ID!)
-            APPEAL_CHAT_ID = 3404461183   # Замените на реальный ID группы
+            APPEAL_CHAT_ID = -1003808268065   # Замените на реальный ID группы
 
             # Пытаемся отправить в группу апелляций
             try:
@@ -5598,73 +5598,13 @@ async def handle_chat_join(event):
     joined_users_cache.add(user_id)
     asyncio.create_task(remove_from_cache_later(user_id))
 
-    # Получение роли
-    user_role = db.get_user_role(user_id)
-    image_url = "https://i.ibb.co/q3qgMsQz/photo-2025-04-17-17-44-18.jpg"
-
-    # Для кодера
-    if user_role == 11:
-        buttons = [[Button.inline("🤗", "welcome_coder")]]
-        text = f"""
-☕ Добро пожаловать! [{user.first_name}](tg://user?id={user.id})
-
-Добро пожаловать!!😊
-
-[🤗]({image_url})
-"""
-        await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
-
-    # Для персонала
-    elif user_role in [6, 7, 8, 9, 10]:
-        text = f"""
-☕ Добро пожаловать! [{user.first_name}](tg://user?id={user.id})
-
-[🤗]({image_url})
-"""
-        await event.respond(text, parse_mode='md', link_preview=True)
-
-    # Проверенный гарантом
-    elif user_role == 12:
-        text = f"""
-🔥 К чату присоединился человек, проверенный гарантом Grand
-
-[🤗]({image_url})
-"""
-        await event.respond(text, parse_mode='md', link_preview=True)
-
-    # Скамер
-    elif user_role == 3:
-        buttons = [[Button.inline("ЗАБАНИТЬ ⛔", f"ban_{user.id}")]]
-        text = f"""
-⚠️ К чату присоединился [{user.first_name}](tg://user?id={user.id}) **Скаммер**!
-
-Не доверяйте этому человеку.
-
-[🤗]({image_url})
-"""
-        await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
-
-    # Подозреваемый в скаме
-    elif user_role in [2, 4, 5]:
-        buttons = [[Button.inline("ЗАБАНИТЬ ⛔", f"ban_{user.id}")]]
-        text = f"""
-⚠️ К чату присоединился [{user.first_name}](tg://user?id={user.id}) с высоким шансом скама!
-
-Вероятность скама: {ROLES[user_role]['scam_chance']}%
-
-[🤗]({image_url})
-"""
-        await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
-
-    # Неизвестный пользователь
-    else:
-        buttons = [[Button.inline("🤗", "welcome")]]
-        text = f"""
+    # УПРОЩЕННОЕ ПРИВЕТСТВИЕ ДЛЯ ВСЕХ РОЛЕЙ
+    text = f"""
 👋 Добро пожаловать! [{user.first_name}](tg://user?id={user.id})
 
 [🤗](https://i.ibb.co/q3qgMsQz/photo-2025-04-17-17-44-18.jpg)
 """
-        await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
+    await event.respond(text, parse_mode='md', link_preview=True)
 
     # Проверка мута
     if user_id in muted_users:
