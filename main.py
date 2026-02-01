@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 API_ID = '27231812'
 API_HASH = '59d6d299a99f9bb97fcbf5645d9d91e9'
-BOT_TOKEN = '8502910736:AAEHCK5bWfKv06oWZaPng-6G9zRcD8tDoBw'
+BOT_TOKEN = '8502910736:AAECRUQag8PE2aE9uykYwKQgwg0VkmHwaZI'
 ADMINS = [262511724]  # ID администраторов
 LOG_CHANNEL = 'https://t.me/+cnym32Oi-mJiMGNi'  # Ссылка на канал логов
 
