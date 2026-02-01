@@ -49,6 +49,11 @@ OWNER_ID = [262511724]
 # Добавьте после других глобальных переменных
 APPEAL_CHAT_ID = -1003808268065  # Замените на реальный ID чата для апелляций
 
+# Глобальная переменная для управления рассылкой
+broadcast_active = False  # По умолчанию выключена
+BROADCAST_CHAT_ID = -1002440915213  # ID чата для рассылки (InfinityAntiScam)
+BROADCAST_INTERVAL = 300
+
 class Database:
     def __init__(self, db_name='Ice.db'):
         logging.info("Инициализация базы данных...")
@@ -361,10 +366,8 @@ class Database:
             return False
 
     def user_exists(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users WHERE user_id = ?", (user_id,))
-        exists = cursor.fetchone()[0] > 0
-        cursor.close()
+        self.cursor.execute("SELECT COUNT(*) FROM users WHERE user_id = ?", (user_id,))
+        exists = self.cursor.fetchone()[0] > 0
         return exists
 
     def execute(self, query, params=()):
@@ -376,8 +379,6 @@ class Database:
             self.conn.commit()  # Сохранение изменений
         except sqlite3.Error as e:
             print(f"Ошибка при выполнении запроса: {e}")  # Обработка ошибок
-
-
 
     def update_total_messages(self, count):
         try:
@@ -406,8 +407,7 @@ class Database:
 
     def increment_scammers_count(self, user_id):
         """Увеличивает счетчик слитых скаммеров для пользователя с указанным user_id."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE users SET scammers_slept = scammers_slept + 1 WHERE user_id = ?", (user_id,))
+        self.cursor.execute("UPDATE users SET scammers_slept = scammers_slept + 1 WHERE user_id = ?", (user_id,))
         self.conn.commit()
 
     def add_user(self, user_id, username, role_id=0):
@@ -476,8 +476,8 @@ class Database:
 
         try:
             # Изменяем запрос на правильный столбец
-            cursor = self.cursor.execute('SELECT custom_photo_url FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
+            self.cursor.execute('SELECT custom_photo_url FROM users WHERE user_id = ?', (user_id,))
+            result = self.cursor.fetchone()
 
             logging.info(f"SQL query executed for user_id {user_id}. Result: {result}")
 
@@ -511,16 +511,14 @@ class Database:
 
     def get_user_curator(self, user_id):
         query = "SELECT curator_id FROM users WHERE user_id = ?"
-        cursor = self.conn.cursor()  # Изменено на self.conn
-        cursor.execute(query, (user_id,))
-        result = cursor.fetchone()
+        self.cursor.execute(query, (user_id,))
+        result = self.cursor.fetchone()
         return result[0] if result else None
 
     def get_user_name(self, user_id):
         query = "SELECT username FROM users WHERE user_id = ?"
-        cursor = self.conn.cursor()
-        cursor.execute(query, (user_id,))
-        result = cursor.fetchone()
+        self.cursor.execute(query, (user_id,))
+        result = self.cursor.fetchone()
         return result[0] if result else "Не указано"
 
     def get_last_spin(self, user_id):
@@ -855,9 +853,8 @@ class Database:
         return result
 
     def is_scammer(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM scammers WHERE user_id = ?", (user_id,))
-        return cursor.fetchone() is not None
+        self.cursor.execute("SELECT * FROM scammers WHERE user_id = ?", (user_id,))
+        return self.cursor.fetchone() is not None
 
     async def update_user_check_count(self, user_id):
         async with self.lock:
@@ -912,13 +909,12 @@ class Database:
                 return False  # Возвращаем False, чтобы бот сообщил об ошибке
 
             # Удаление пользователя из таблицы скаммеров
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM scammers WHERE user_id = ?", (user_id,))
+            self.cursor.execute("DELETE FROM scammers WHERE user_id = ?", (user_id,))
             self.conn.commit()
 
             # Обновление роли пользователя на "Нет в базе" (0)
-            query = "UPDATE users SET role_id = 0 WHERE user_id = ?"
-            self.execute(query, (user_id,))
+            self.cursor.execute("UPDATE users SET role_id = 0 WHERE user_id = ?", (user_id,))
+            self.conn.commit()
             logging.info(f"Статус скамера для пользователя {user_id} успешно снят.")
 
             return True  # Возвращаем True, если всё прошло успешно
@@ -928,12 +924,10 @@ class Database:
 
     def set_user_allowance(self, user_id, amount):
         try:
-            # Используем текущее соединение, а не создаем новое
-            cursor = self.cursor  # Используем курсор из существующего соединения
-            cursor.execute("UPDATE users SET allowance = ? WHERE user_id = ?", (amount, user_id))
+            self.cursor.execute("UPDATE users SET allowance = ? WHERE user_id = ?", (amount, user_id))
             self.conn.commit()
 
-            if cursor.rowcount == 0:
+            if self.cursor.rowcount == 0:
                 logging.warning(f"Пользователь с ID {user_id} не найден.")
             else:
                 logging.info(f"Сумма ручения для пользователя с ID {user_id} успешно обновлена на {amount}.")
@@ -1056,6 +1050,7 @@ async def check_user(event):
                     user_id_to_check = int(args[0])
                     user_data = db.get_user(user_id_to_check) if db else None
                     if user_data:
+                        # ИСПРАВЛЕНИЕ: создаем объект с атрибутом id
                         user_to_check = type('obj', (object,), {'id': user_id_to_check})()
                     else:
                         await loading_msg.delete()
@@ -1067,6 +1062,7 @@ async def check_user(event):
                 await loading_msg.delete()
                 return await send_response(event, "❌ | Не удалось найти пользователя.")
 
+    # ИСПРАВЛЕНИЕ: Проверяем, что user_to_check не None
     if user_to_check is None:
         await loading_msg.delete()
         return await send_response(event, "❌ | Не удалось определить пользователя.")
@@ -1114,610 +1110,6 @@ async def check_user(event):
         await loading_msg.delete()
     except Exception as e:
         logging.error(f"Ошибка при удалении сообщения о загрузке: {e}")
-
-
-
-    # Пример реализации метода user_exists
-    def user_exists(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM users WHERE user_id = ?", (user_id,))
-        exists = cursor.fetchone()[0] > 0
-        cursor.close()
-        return exists
-
-    def execute(self, query, params=()):
-        """
-        Выполняет SQL-запрос с передачей параметров.
-
-        :param query: SQL-запрос для выполнения
-        :param params: Параметры для SQL-запроса
-        """
-        try:
-            self.cursor.execute(query, params)  # Выполнение запроса
-            self.conn.commit()  # Сохранение изменений
-        except sqlite3.Error as e:
-            print(f"Ошибка при выполнении запроса: {e}")  # Обработка ошибок
-        finally:
-            # Закрытие курсора, если необходимо
-            pass
-
-    def update_total_messages(self, count):
-        try:
-            logging.info("Обновление количества сообщений...")
-            self.cursor.execute('UPDATE statistics SET total_messages = total_messages + ?', (count,))
-            self.conn.commit()
-            current_count = self.get_total_messages()
-            logging.info(f"Текущее количество сообщений в базе данных: {current_count}")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка обновления количества сообщений: {e}")
-
-    def get_granted_by(self, user_id):
-        """Получает ID гаранта для указанного user_id."""
-        self.cursor.execute("SELECT granted_by_id FROM users WHERE user_id = ?", (user_id,))
-        result = self.cursor.fetchone()
-        if result:
-            logging.info(f"Гарант найден для user_id {user_id}: {result[0]}")
-        else:
-            logging.warning(f"Гарант не найден для user_id {user_id}.")
-        return result[0] if result else None
-
-    def get_total_messages(self):
-        self.cursor.execute('SELECT total_messages FROM statistics')
-        result = self.cursor.fetchone()
-        return result[0] if result is not None else 0
-
-    def increment_scammers_count(self, user_id):
-        """Увеличивает счетчик слитых скаммеров для пользователя с указанным user_id."""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE users SET scammers_slept = scammers_slept + 1 WHERE user_id = ?", (user_id,))
-        self.conn.commit()
-
-    def add_user(self, user_id, username, role_id=0):
-        try:
-            self.cursor.execute('''
-                INSERT INTO users (user_id, username, role_id)
-                VALUES (?, ?, ?)
-            ''', (user_id, username, role_id))
-            self.conn.commit()
-            logging.info(f"Пользователь {username} с ID {user_id} добавлен с ролью {role_id}.")
-        except Exception as e:
-            logging.error(f"Ошибка при добавлении пользователя: {e}")
-
-    def get_user_role(self, user_id):
-        self.cursor.execute('SELECT role_id FROM users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        role = result[0] if result else 0
-        logging.info(f"Роль пользователя {user_id}: {role}")
-        return role
-
-    def update_user(self, user_id, country=None, channel=None):
-        logging.info(f"Обновление пользователя {user_id}: страна - {country}, канал - {channel}")
-
-        # Явная проверка на None для страны
-        if country is not None:
-            logging.info(f"Обновляем страну на: {country}")
-            self.cursor.execute('UPDATE users SET country = ? WHERE user_id = ?', (country, user_id))
-
-        # Явная проверка на None для канала
-        if channel is not None:
-            logging.info(f"Обновляем канал на: {channel}")
-            self.cursor.execute('UPDATE users SET channel = ? WHERE user_id = ?', (channel, user_id))
-
-        # Выполнение коммита для сохранения изменений
-        self.conn.commit()
-
-        # Проверка обновленных данных
-        self.cursor.execute('SELECT country, channel FROM users WHERE user_id = ?', (user_id,))
-        user_data = self.cursor.fetchone()
-
-        # Логирование обновленных данных
-        if user_data:
-            logging.info(
-                f"Данные пользователя после обновления: id={user_id}, страна={user_data[0]}, канал={user_data[1]}")
-        else:
-            logging.warning(f"Пользователь с id={user_id} не найден после обновления.")
-
-    def get_user_allowance(self, user_id):
-        """Получает сумму ручения для указанного пользователя."""
-        try:
-            self.cursor.execute("SELECT allowance FROM users WHERE user_id = ?", (user_id,))
-            result = self.cursor.fetchone()
-            if result:
-                allowance = result[0]
-                logging.info(f"Сумма ручения для пользователя {user_id}: {allowance}")
-                return allowance
-            else:
-                logging.warning(f"Пользователь с ID {user_id} не найден.")
-                return None
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при получении суммы ручения для пользователя {user_id}: {e}")
-            return None
-
-    def get_user_custom_photo(self, user_id):
-        logging.info(f"Attempting to retrieve custom photo for user_id: {user_id}")
-
-        try:
-            # Изменяем запрос на правильный столбец
-            cursor = self.cursor.execute('SELECT custom_photo_url FROM users WHERE user_id = ?', (user_id,))
-            result = cursor.fetchone()
-
-            logging.info(f"SQL query executed for user_id {user_id}. Result: {result}")
-
-            if result:
-                custom_photo = result[0]
-                logging.info(f"Retrieved custom photo for user {user_id}: {custom_photo}")
-            else:
-                logging.warning(f"No custom photo found for user_id: {user_id}. Result was None.")
-                custom_photo = None
-
-        except Exception as e:
-            logging.error(f"Error retrieving custom photo for user_id {user_id}: {str(e)}")
-            custom_photo = None
-
-        if custom_photo is None:
-            logging.info(f"Custom photo for user_id {user_id} is None or not found.")
-        else:
-            logging.info(f"Custom photo URL for user_id {user_id}: {custom_photo}")
-
-        return custom_photo
-
-
-    def get_user_name(self, user_id):
-        query = "SELECT username FROM users WHERE user_id = ?"
-        cursor = self.conn.cursor()
-        cursor.execute(query, (user_id,))
-        result = cursor.fetchone()
-        return result[0] if result else "Не указано"
-
-    def get_last_spin(self, user_id):
-        """Получает время последнего использования команды рулетки для указанного пользователя."""
-        self.cursor.execute('SELECT last_spin FROM users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result[0] if result else None
-
-    def update_last_spin(self, user_id):
-        """Обновляет время последнего использования команды рулетки для указанного пользователя."""
-        self.cursor.execute('UPDATE users SET last_spin = ? WHERE user_id = ?', (datetime.now(), user_id))
-        self.conn.commit()
-
-    def add_grant(self, user_id, granted_by_id):
-        """Добавляет запись о гарантии для пользователя."""
-        try:
-            self.cursor.execute('''
-                INSERT INTO trust (user_id, granted_by, grant_date)
-                VALUES (?, ?, ?)
-            ''', (user_id, granted_by_id, datetime.now().isoformat()))
-            self.conn.commit()
-            logging.info(f"Запись о гарантии для user_id {user_id} добавлена. Granted by ID: {granted_by_id}.")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при добавлении записи о гарантии для user_id {user_id}: {e}")
-
-    def set_profile_checks_count(self, user_id, checks_count):
-        # Устанавливаем количество проверок для пользователя
-        logging.info(f"Устанавливаем количество проверок для пользователя {user_id}: {checks_count}")
-
-        # Проверяем, существует ли пользователь
-        if self.get_user(user_id) is None:
-            logging.warning(f"Пользователь {user_id} не найден. Не удается установить количество проверок.")
-            return
-
-        self.cursor.execute("UPDATE users SET checks_count = ? WHERE user_id = ?", (checks_count, user_id))
-        self.connection.commit()
-        logging.info(f"Количество проверок для пользователя {user_id} успешно установлено на {checks_count}")
-
-    def get_profile_checks_count(self, user_id):
-        # Получаем количество проверок для пользователя
-        logging.info(f"Запрос количества проверок для пользователя {user_id}")
-        self.cursor.execute("SELECT checks_count FROM users WHERE user_id = ?", (user_id,))
-        result = self.cursor.fetchone()
-
-        if result is not None:
-            logging.info(f"Количество проверок для пользователя {user_id}: {result[0]}")
-        else:
-            logging.warning(f"Пользователь {user_id} не найден в базе данных.")
-
-        return result[0] if result else None
-
-    def update_profile_checks_count(self, user_id, checks_count):
-        # Обновляем количество проверок профиля
-        if checks_count < 0:
-            logging.warning(
-                f"Попытка установить отрицательное количество проверок для пользователя {user_id}. Устанавливаем 0.")
-            checks_count = 0
-
-        logging.info(f"Обновляем количество проверок для пользователя {user_id} на {checks_count}")
-        self.cursor.execute("UPDATE users SET checks_count = ? WHERE user_id = ?", (checks_count, user_id))
-        self.connection.commit()
-        logging.info(f"Количество проверок для пользователя {user_id} успешно обновлено на {checks_count}")
-
-    def add_premium(self, user_id, expiry_date):
-        """Добавляет пользователя в премиум с указанной датой окончания."""
-        try:
-            self.cursor.execute('''
-                INSERT INTO premium_users (user_id, expiry_date)
-                VALUES (?, ?)
-            ''', (user_id, expiry_date))
-            self.conn.commit()
-            logging.info(f"Пользователь {user_id} добавлен в премиум до {expiry_date}.")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при добавлении пользователя {user_id} в премиум: {e}")
-
-    def is_premium_user(self, user_id):
-        self.cursor.execute('SELECT expiry_date FROM premium_users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        if result:
-            expiry_date = result[0]
-            logging.info(f"Пользователь {user_id} имеет премиум статус до {expiry_date}.")
-            return expiry_date
-        else:
-            logging.warning(f"Пользователь {user_id} не найден в таблице premium_users.")
-            return None
-
-    def remove_premium(self, user_id):
-        # Удаляем премиум статус пользователя из таблицы users
-        db.cursor.execute('UPDATE users SET premium = NULL, premium_expiry = NULL WHERE user_id = ?', (user_id,))
-        # Удаляем запись из таблицы premium_users
-        db.cursor.execute('DELETE FROM premium_users WHERE user_id = ?', (user_id,))
-        db.conn.commit()
-
-    def get_premium_expiry(self, user_id):
-        """Возвращает дату истечения премиум статуса для пользователя."""
-        self.cursor.execute('SELECT expiry_date FROM premium_users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        logging.info(f"Результат запроса для пользователя {user_id}: {result}")
-        return result[0] if result else None
-
-    def increment_check_count(self, user_id):
-        """Увеличивает счетчик проверок для пользователя с указанным user_id, добавляя пользователя в базу, если он не найден."""
-        try:
-            # Проверяем, существует ли пользователь
-            self.cursor.execute('SELECT COUNT(*) FROM users WHERE user_id = ?', (user_id,))
-            user_exists = self.cursor.fetchone()[0] > 0
-
-            if not user_exists:
-                # Если пользователь не найден, добавляем его в базу данных
-                self.cursor.execute('INSERT INTO users (user_id, check_count) VALUES (?, ?)', (user_id, 0))
-                logging.info(f"Пользователь с ID {user_id} добавлен в базу данных.")
-
-            # Увеличиваем счетчик
-            self.cursor.execute('UPDATE users SET check_count = check_count + 1 WHERE user_id = ?', (user_id,))
-            self.conn.commit()
-            logging.info(f"Счетчик проверок для пользователя {user_id} увеличен.")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка обновления счетчика проверок для {user_id}: {e}")
-
-    def update_warnings(self, user_id):
-        try:
-            self.cursor.execute('UPDATE users SET warnings = warnings + 1 WHERE user_id = ?', (user_id,))
-            self.conn.commit()
-            logging.info(f"Количество выговоров для пользователя {user_id} увеличено.")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка обновления выговоров для {user_id}: {e}")
-
-    def get_warnings_count(self, user_id):
-        result = self.cursor.execute('SELECT warnings FROM users WHERE user_id = ?', (user_id,)).fetchone()
-        return result[0] if result is not None else 0
-
-    def reset_warnings(self, user_id):
-        """Сбрасывает количество выговоров до 0 для указанного пользователя."""
-        self.cursor.execute('UPDATE users SET warnings = 0 WHERE user_id = ?', (user_id,))
-        self.conn.commit()
-        logging.info(f"Количество выговоров для пользователя {user_id} сброшено до 0.")
-
-    def delete_old_description(self, user_id):
-        """Удаляет старое описание."""
-        self.cursor.execute("DELETE FROM reasons WHERE user_id = ?", (user_id,))
-        self.conn.commit()
-
-    def add_or_update_premium_user(self, user_id, expiry_date):
-        try:
-            existing_user = self.cursor.execute('SELECT * FROM premium_users WHERE user_id = ?', (user_id,)).fetchone()
-            if existing_user:
-                self.cursor.execute('UPDATE premium_users SET expiry_date = ? WHERE user_id = ?',
-                                    (expiry_date, user_id))
-                logging.info(f"Обновлена дата истечения для пользователя {user_id}: {expiry_date}")
-            else:
-                self.cursor.execute('INSERT INTO premium_users (user_id, expiry_date) VALUES (?, ?)',
-                                    (user_id, expiry_date))
-                logging.info(f"Добавлен пользователь {user_id} с премиум статусом до {expiry_date}")
-            self.conn.commit()
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при добавлении/обновлении пользователя {user_id} в премиум: {e}")
-
-    def update_description(self, user_id, new_description):
-        try:
-            # Обновление описания пользователя в базе данных
-            self.cursor.execute("UPDATE users SET description = ? WHERE user_id = ?", (new_description, user_id))
-            self.conn.commit()  # Зафиксировать изменения
-
-            # Логирование успешного обновления
-            logging.info(f"Описание для пользователя {user_id} обновлено на: {new_description}")
-
-            # Вставка нового описания в статус
-            self.update_status(user_id, new_description)
-        except Exception as e:
-            logging.error(f"Ошибка при обновлении описания: {str(e)}")
-
-    def is_user_in_db(self, user_id):
-        """Проверяет, есть ли пользователь в базе данных."""
-        self.cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
-        return self.cursor.fetchone() is not None
-
-    # В методе get_user_info:
-    def get_user_info(self, user_id):
-        self.cursor.execute('''
-            SELECT user_id, username, role 
-            FROM users 
-            WHERE user_id = ?
-        ''', (user_id,))
-        return self.cursor.fetchone()  # Возвращает sqlite3.Row
-
-    def update_status(self, user_id, new_description):
-        try:
-            # Обновление статуса с новым описанием
-            status_message = f"Новое описание: {new_description}"
-            self.cursor.execute("UPDATE users SET status = ? WHERE user_id = ?", (status_message, user_id))
-            self.conn.commit()  # Зафиксировать изменения
-
-            logging.info(f"Статус для пользователя {user_id} обновлен на: {status_message}")
-        except Exception as e:
-            logging.error(f"Ошибка при обновлении статуса: {str(e)}")
-
-    def update_user_description(self, user_id, description):
-        """Обновляет описание пользователя."""
-        try:
-            logging.info(f"Попытка обновления описания пользователя {user_id} на: {description}.")
-
-            # Проверяем, существует ли пользователь перед обновлением
-            existing_user = self.get_user(user_id)
-            if not existing_user:
-                logging.warning(f"Пользователь с ID {user_id} не найден. Описание не может быть обновлено.")
-                return False
-
-            # Обновляем описание
-            self.cursor.execute('UPDATE users SET description = ? WHERE user_id = ?', (description, user_id))
-            self.conn.commit()
-
-            # Проверяем, обновилось ли описание
-            updated_description = self.get_user_description(user_id)
-            if updated_description == description:
-                logging.info(f"Описание пользователя {user_id} успешно обновлено на: {description}.")
-            else:
-                logging.error(
-                    f"Описание пользователя {user_id} не обновилось. Текущее значение: {updated_description}.")
-
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка обновления описания для {user_id}: {e}")
-            return False
-
-    def get_user_description(self, user_id):
-        try:
-            self.cursor.execute('SELECT description FROM scammers WHERE user_id = ?', (user_id,))
-            result = self.cursor.fetchone()
-            if result and result[0]:
-                logging.info(f"Описание для пользователя {user_id}: {result[0]}.")
-                return result[0]
-            else:
-                logging.warning(f"Описание для пользователя {user_id} не найдено.")
-                return "Описание отсутствует"
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при получении описания для пользователя {user_id}: {e}")
-            return "Ошибка базы данных"
-
-    def update_role(self, user_id, role_id, granted_by_id=None):
-        try:
-            self.cursor.execute('UPDATE users SET role_id = ? WHERE user_id = ?', (role_id, user_id))
-
-            if granted_by_id is not None:
-                self.cursor.execute('UPDATE users SET granted_by_id = ? WHERE user_id = ?', (granted_by_id, user_id))
-
-            # ВСЕГДА делаем commit
-            self.conn.commit()
-            logging.info(f"Роль пользователя {user_id} обновлена на {role_id}. Granted by ID: {granted_by_id}.")
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка обновления роли для {user_id}: {e}")
-            return False
-
-    def add_scammer(self, scammer_id, reason, reported_by, description, unique_id):
-        # Проверка, существует ли пользователь
-        self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (scammer_id,))
-        user = self.cursor.fetchone()
-
-        if user is None:
-            logging.error(f"Пользователь с ID {scammer_id} не найден. Не могу добавить скамера.")
-            return
-
-        try:
-            # Попытка добавить скаммера или обновить, если он уже существует
-            self.cursor.execute('''
-                INSERT INTO scammers (user_id, reason, reported_by, description, scammer_id, unique_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(user_id) DO UPDATE SET 
-                    reason = excluded.reason,
-                    reported_by = excluded.reported_by,
-                    description = excluded.description,
-                    unique_id = excluded.unique_id
-            ''', (scammer_id, reason, reported_by, description, scammer_id, unique_id))
-            self.conn.commit()
-            logging.info(f"Скаммер {scammer_id} добавлен/обновлен с причиной: {reason}. Уникальный ID: {unique_id}.")
-        except Exception as e:
-            logging.error(f"Ошибка при добавлении/обновлении скамера: {e}")
-
-    def update_reason(self, user_id, reason):
-        """Обновляет причину заноса для указанного пользователя."""
-        self.cursor.execute('''
-            INSERT INTO reasons (user_id, reason) VALUES (?, ?)
-            ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason
-        ''', (user_id, reason))
-        self.conn.commit()
-
-    def add_additional_reason(self, user_id, additional_reason):
-        """Добавляет дополнительное описание для указанного пользователя."""
-        # Предполагаем, что у вас есть отдельная таблица для дополнительных описаний
-        self.cursor.execute('''
-            INSERT INTO additional_reasons (user_id, additional_reason) VALUES (?, ?)
-        ''', (user_id, additional_reason))
-        self.conn.commit()
-
-    async def scam_command(event):
-        user_id = event.sender_id  # ID пользователя, который сообщает о скаммере
-        scammer_username = event.message.text.split('@')[1]  # Извлечение имени скамера из команды
-        reason = "Причина скамера"  # Причина сообщения о скаммере
-        description = reason  # Устанавливаем описание как причину
-
-        # Логирование перед вызовом метода
-        logging.info(f"Вызов add_scammer с аргументами: {user_id}, {scammer_username}, {reason}, {description}")
-
-        # Проверяем, существует ли скаммер в базе данных
-        existing_scammer = db.get_user_by_username(scammer_username)  # Метод для получения пользователя по имени
-        if existing_scammer:
-            scammer_id = existing_scammer[0]  # Получаем ID скамера
-        else:
-            # Если скаммер не существует, добавляем его
-            db.add_user(scammer_username, scammer_username)  # Добавляем скамера с именем
-            scammer_id = db.get_user_by_username(scammer_username)[0]  # Получаем ID после добавления
-            logging.info(f"Пользователь {scammer_username} добавлен в базу данных с ID {scammer_id}.")
-
-        # Убедитесь, что scammer_id существует перед добавлением скамера
-        if scammer_id:
-            try:
-                # Вызов метода добавления скамера
-                db.add_scammer(user_id, reason, description, scammer_id)
-            except Exception as e:
-                logging.error(f"Ошибка при добавлении скамера: {e}")
-        else:
-            logging.error(f"Не удалось получить ID скамера для пользователя {scammer_username}.")
-
-    def get_user_scammers_count(self, user_id):
-        self.cursor.execute('SELECT scammers_slept FROM users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result[0] if result else 0
-
-    def update_user_scammers_count(self, user_id, new_count):
-        """Обновляет количество слитых скаммеров для указанного пользователя."""
-        try:
-            self.cursor.execute('UPDATE users SET scammers_slept = ? WHERE user_id = ?', (new_count, user_id))
-            self.conn.commit()
-            logging.info(f"Количество слитых скаммеров для пользователя {user_id} обновлено на {new_count}.")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при обновлении количества слитых скаммеров для {user_id}: {e}")
-
-    def get_user(self, user_id):
-        self.cursor.execute('SELECT * FROM users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        if result:
-            logging.info(f"Пользователь найден: {result}")
-        else:
-            logging.info(f"Пользователь с ID {user_id} не найден.")
-        return result
-
-    def is_scammer(self, user_id):
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT * FROM scammers WHERE user_id = ?", (user_id,))
-        return cursor.fetchone() is not None
-
-    async def update_user_check_count(self, user_id):
-        async with self.lock:
-            try:
-                self.cursor.execute('UPDATE users SET check_count = check_count + 1 WHERE user_id = ?', (user_id,))
-                self.conn.commit()
-                logging.info(f"Счетчик проверок для пользователя {user_id} обновлен.")
-            except sqlite3.Error as e:
-                logging.error(f"Ошибка при обновлении счетчика проверок для {user_id}: {e}")
-
-    def get_check_count(self, user_id):
-        try:
-            self.cursor.execute('SELECT check_count FROM users WHERE user_id = ?', (user_id,))
-            result = self.cursor.fetchone()
-            count = result[0] if result else 0
-            logging.info(f"Количество проверок для пользователя {user_id}: {count}")
-            return count
-        except Exception as e:
-            logging.error(f"Ошибка базы данных в get_check_count: {e}")
-            return 0
-
-    def get_user_scammers_slept(self, user_id):
-        """Получает количество слитых скаммеров для указанного пользователя."""
-        logging.info(f"Запрос на получение количества слитых скаммеров для пользователя {user_id}.")
-        query = 'SELECT scammers_slept FROM users WHERE user_id = ?'
-        self.cursor.execute(query, (user_id,))
-        result = self.cursor.fetchone()
-        if result:
-            logging.info(f"Пользователь {user_id} имеет {result[0]} слитых скаммеров.")
-            return result[0]
-        else:
-            logging.warning(f"Пользователь {user_id} не найден, возвращаем 0.")
-            return 0
-
-    def update_user_scammers_slept(self, user_id, new_count):
-        logging.info(f"Обновление количества слитых скаммеров для пользователя {user_id} на {new_count}.")
-        try:
-            self.cursor.execute('''
-                UPDATE users SET scammers_slept = ? WHERE user_id = ?
-            ''', (new_count, user_id))
-            self.conn.commit()
-            logging.info(f"Количество слитых скаммеров для пользователя {user_id} успешно обновлено на {new_count}.")
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка обновления количества слитых скаммеров для пользователя {user_id}: {e}")
-            return False
-
-    def remove_scammer_status(self, user_id):
-        try:
-            # Проверка, есть ли пользователь в базе скаммеров
-            if not self.is_scammer(user_id):  # Если пользователя уже нет в базе
-                return False  # Возвращаем False, чтобы бот сообщил об ошибке
-
-            # Удаление пользователя из таблицы скаммеров
-            cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM scammers WHERE user_id = ?", (user_id,))
-            self.conn.commit()
-
-            # Обновление роли пользователя на "Нет в базе" (0)
-            query = "UPDATE users SET role_id = 0 WHERE user_id = ?"
-            self.execute(query, (user_id,))
-            logging.info(f"Статус скамера для пользователя {user_id} успешно снят.")
-
-            return True  # Возвращаем True, если всё прошло успешно
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при удалении статуса скамера для пользователя {user_id}: {e}")
-            return False  # Возвращаем False, если произошла ошибка
-
-    def set_user_allowance(self, user_id, amount):
-        try:
-            # Используем текущее соединение, а не создаем новое
-            cursor = self.cursor  # Используем курсор из существующего соединения
-            cursor.execute("UPDATE users SET allowance = ? WHERE user_id = ?", (amount, user_id))
-            self.conn.commit()
-
-            if cursor.rowcount == 0:
-                logging.warning(f"Пользователь с ID {user_id} не найден.")
-            else:
-                logging.info(f"Сумма ручения для пользователя с ID {user_id} успешно обновлена на {amount}.")
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка при обновлении суммы ручения: {e}")
-
-    async def __aenter__(self):
-        await self.lock.acquire()
-        logging.info("База данных открыта для асинхронного доступа.")
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.lock.release()
-        logging.info("База данных закрыта для асинхронного доступа.")
-
-    def close(self):
-        try:
-            self.conn.close()
-            logging.info("Соединение с базой данных закрыто.")
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Ошибка закрытия БД: {e}")
-            return False
-
-
 
 
 # Инициализация бота
@@ -6065,11 +5457,243 @@ async def help_soon_handler(event):
     await event.edit(help_text, buttons=[Button.inline("« Назад", "back_to_profile")])
 
 
+# ============ ФУНКЦИИ РАССЫЛКИ ============
+
+async def send_broadcast_message():
+    """Функция для отправки сообщения рассылки в указанный чат"""
+    global broadcast_active, BROADCAST_INTERVAL
+
+    while broadcast_active:
+        try:
+            # Текст сообщения
+            text = """➕ Infinity - надёжная анти-скам база для проверки пользователей!
+
+Проект нацелен обезопасить вас и ваши сделки от недобросовестных скамеров, сливая скамеров — вы помогаете развивать проект, обезопасив себя и других пользователей!
+
+💬 Как проверять на скам, показано на фото ниже:
+
+[⠀](https://files.catbox.moe/zs50do.jpg)"""
+
+            # Кнопки
+            buttons = [
+                [Button.url("💬 Предложка", "https://t.me/InfinityAntiScam")],
+                [Button.url("📢 Новостник", "https://t.me/InfinityReportNews")]
+            ]
+
+            # Отправляем сообщение только в указанный чат
+            try:
+                logging.info(f"🔄 Пытаюсь отправить рассылку в чат ID: {BROADCAST_CHAT_ID}")
+                message = await bot.send_message(
+                    BROADCAST_CHAT_ID,
+                    text,
+                    buttons=buttons,
+                    parse_mode='md',
+                    link_preview=True
+                )
+                logging.info(f"✅ Рассылка успешно отправлена! ID сообщения: {message.id}")
+                logging.info(f"⏱ Следующая рассылка через {BROADCAST_INTERVAL // 60} минут")
+            except Exception as e:
+                error_msg = str(e)
+                logging.error(f"❌ ОШИБКА отправки рассылки:")
+                logging.error(f"   Чат ID: {BROADCAST_CHAT_ID}")
+                logging.error(f"   Тип ошибки: {type(e).__name__}")
+                logging.error(f"   Подробности: {error_msg}")
+
+                # Проверяем специфические ошибки
+                if "CHAT_WRITE_FORBIDDEN" in error_msg or "no rights" in error_msg.lower():
+                    logging.error("   🔒 У бота нет прав для отправки сообщений в этот чат!")
+                elif "PEER_ID_INVALID" in error_msg:
+                    logging.error("   ❌ Неверный ID чата!")
+                elif "CHANNEL_PRIVATE" in error_msg:
+                    logging.error("   🔒 Бот не является участником этого канала/чата!")
+
+            # Ждем указанный интервал перед следующей рассылкой
+            logging.info(f"⏳ Ожидание {BROADCAST_INTERVAL} секунд до следующей рассылки...")
+            await asyncio.sleep(BROADCAST_INTERVAL)
+
+        except Exception as e:
+            logging.error(f"Критическая ошибка в функции рассылки: {e}")
+            await asyncio.sleep(60)  # Подождать минуту при ошибке
+
+
+@bot.on(events.NewMessage(pattern='/testbroadcast'))
+async def test_broadcast(event):
+    """Команда для тестовой отправки сообщения рассылки"""
+    user_id = event.sender_id
+    user_role = db.get_user_role(user_id)
+
+    # Проверяем права (только создатель, кодер или администраторы)
+    if user_id not in OWNER_ID and user_role not in [10]:
+        await event.respond("❌ У вас нет прав для тестирования рассылки!")
+        return
+
+    try:
+        # Текст сообщения
+        text = """➕ Infinity - надёжная анти-скам база для проверки пользователей!
+
+Проект нацелен обезопасить вас и ваши сделки от недобросовестных скамеров, сливая скамеров — вы помогаете развивать проект, обезопасив себя и других пользователей!
+
+💬 Как проверять на скам, показано на фото ниже:
+
+[⠀](https://files.catbox.moe/zs50do.jpg)"""
+
+        # Кнопки
+        buttons = [
+            [Button.url("💬 Предложка", "https://t.me/InfinityAntiScam")],
+            [Button.url("📢 Новостник", "https://t.me/InfinityReportNews")]
+        ]
+
+        # Пытаемся отправить тестовое сообщение
+        await event.respond("🔄 Пытаюсь отправить тестовое сообщение...")
+
+        try:
+            message = await bot.send_message(
+                BROADCAST_CHAT_ID,
+                text,
+                buttons=buttons,
+                parse_mode='md',
+                link_preview=True
+            )
+            await event.respond(f"✅ Тестовое сообщение успешно отправлено!\nID сообщения: {message.id}")
+        except Exception as e:
+            error_msg = str(e)
+            await event.respond(f"❌ ОШИБКА отправки:\n\nТип: {type(e).__name__}\n\nОшибка: {error_msg}")
+
+    except Exception as e:
+        await event.respond(f"❌ Произошла ошибка: {str(e)}")
+
+@bot.on(events.NewMessage(pattern=r'/setbroadcastinterval (\d+)'))
+async def set_broadcast_interval(event):
+    """Команда для изменения интервала рассылки (только для администраторов)"""
+    user_id = event.sender_id
+    user_role = db.get_user_role(user_id)
+
+    # Проверяем права (только создатель, кодер или администраторы)
+    if user_id not in OWNER_ID and user_role not in [10]:
+        await event.respond("❌ У вас нет прав для изменения интервала рассылки!")
+        return
+
+    try:
+        # Получаем новый интервал из аргументов команды
+        args = event.raw_text.split()
+        if len(args) < 2:
+            await event.respond("❌ Использование: `/setbroadcastinterval <минуты>`")
+            return
+
+        new_interval_minutes = int(args[1])
+
+        # Проверяем минимальный интервал (не менее 1 минуты)
+        if new_interval_minutes < 1:
+            await event.respond("❌ Интервал не может быть меньше 1 минуты!")
+            return
+
+        # Проверяем максимальный интервал (не более 24 часов = 1440 минут)
+        if new_interval_minutes > 1440:
+            await event.respond("❌ Интервал не может быть больше 24 часов!")
+            return
+
+        global BROADCAST_INTERVAL
+        old_interval = BROADCAST_INTERVAL
+        BROADCAST_INTERVAL = new_interval_minutes * 60  # Конвертируем минуты в секунды
+
+        await event.respond(
+            f"✅ Интервал рассылки изменен!\n\n"
+            f"📊 Было: {old_interval // 60} минут\n"
+            f"📊 Стало: {new_interval_minutes} минут\n\n"
+            f"⏱ Следующее сообщение будет отправлено через {new_interval_minutes} минут"
+        )
+
+        logging.info(f"Интервал рассылки изменен: {old_interval // 60} минут → {new_interval_minutes} минут")
+
+    except ValueError:
+        await event.respond("❌ Неверный формат! Используйте число минут (например: 10)")
+    except Exception as e:
+        logging.error(f"Ошибка при изменении интервала рассылки: {e}")
+        await event.respond("❌ Произошла ошибка при изменении интервала")
+
+
+# Функция для автоматического запуска рассылки при старте бота
+async def auto_start_broadcast():
+    """Автоматический запуск рассылки при старте бота"""
+    await asyncio.sleep(10)  # Ждем 10 секунд для инициализации бота
+    global broadcast_active
+    broadcast_active = True
+    logging.info("🔄 Автозапуск рассылки в чат InfinityAntiScam")
+    asyncio.create_task(send_broadcast_message())
+
+
+@bot.on(events.NewMessage(pattern='/рассылкаON'))
+async def start_broadcast(event):
+    """Команда для запуска рассылки (только для администраторов)"""
+    user_id = event.sender_id
+    user_role = db.get_user_role(user_id)
+
+    # Проверяем права (только создатель, кодер или администраторы)
+    if user_id not in OWNER_ID and user_role not in [10]:
+        await event.respond("❌ У вас нет прав для управления рассылкой!")
+        return
+
+    global broadcast_active
+    if broadcast_active:
+        await event.respond("✅ Рассылка уже активна!")
+    else:
+        broadcast_active = True
+        await event.respond("✅ Рассылка запущена! Сообщения будут отправляться в чат InfinityAntiScam каждые 6 минут.")
+        # Запускаем рассылку в фоне
+        asyncio.create_task(send_broadcast_message())
+
+
+@bot.on(events.NewMessage(pattern='/рассылкаOFF'))
+async def stop_broadcast(event):
+    """Команда для остановки рассылки (только для администраторов)"""
+    user_id = event.sender_id
+    user_role = db.get_user_role(user_id)
+
+    # Проверяем права (только создатель, кодер или администраторы)
+    if user_id not in OWNER_ID and user_role not in [10]:
+        await event.respond("❌ У вас нет прав для управления рассылкой!")
+        return
+
+    global broadcast_active
+    if not broadcast_active:
+        await event.respond("❌ Рассылка уже остановлена!")
+    else:
+        broadcast_active = False
+        await event.respond("⏸ Рассылка остановлена!")
+
+
+@bot.on(events.NewMessage(pattern='/broadcaststatus'))
+async def broadcast_status(event):
+    """Команда для проверки статуса рассылки (только для администраторов)"""
+    user_id = event.sender_id
+    user_role = db.get_user_role(user_id)
+
+    # Проверяем права (только создатель, кодер или администраторы)
+    if user_id not in OWNER_ID and user_role not in [10]:
+        await event.respond("❌ У вас нет прав для просмотра статуса рассылки!")
+        return
+
+    global broadcast_active, BROADCAST_INTERVAL, BROADCAST_CHAT_ID
+    status = "🟢 Активна" if broadcast_active else "🔴 Остановлена"
+    interval_minutes = BROADCAST_INTERVAL // 60
+
+    await event.respond(
+        f"📊 **Статус рассылки:** {status}\n"
+        f"📌 **Чат:** InfinityAntiScam (ID: {BROADCAST_CHAT_ID})\n"
+        f"⏱ **Интервал:** {interval_minutes} минут ({BROADCAST_INTERVAL} секунд)\n\n"
+        f"⚙️ **Команды управления:**\n"
+        f"• `/startbroadcast` - запустить рассылку\n"
+        f"• `/stopbroadcast` - остановить рассылку\n"
+        f"• `/setbroadcastinterval <минуты>` - изменить интервал\n"
+        f"• `/broadcaststatus` - текущий статус"
+    )
+
 def main():
     print("Bot started...")
     bot.run_until_disconnected()
 
 
+bot.loop.create_task(auto_start_broadcast())
 if __name__ == "__main__":
     import logging
 
