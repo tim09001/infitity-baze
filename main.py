@@ -17,7 +17,7 @@ import json
 import os
 import asyncio
 import sqlite3
-import time
+from threading import Lock
 import requests
 import random
 import re
@@ -25,11 +25,30 @@ import hashlib
 import uuid
 from datetime import datetime, timedelta  # Правильный импорт
 from collections import defaultdict
+import functools
+import time
 
 user_scammers_count = {}
 user_states = {}
 checks_count = 0
 
+# ============ ЗАЩИТА ОТ СПАМА ДЛЯ КНОПОК ============
+button_cooldowns = {}
+BUTTON_COOLDOWN_TIME = 2  # секунды между нажатиями кнопок
+user_button_presses = {}  # Счетчик нажатий кнопок для каждого пользователя
+MAX_BUTTON_PRESSES = 3  # Максимальное количество нажатий за период
+BUTTON_PRESS_WINDOW = 10  # Окно времени в секундах
+button_loading_messages = {}  # Хранит ID сообщений о загрузке для каждого пользователя
+
+last_check_time = {}
+last_button_click = {}
+check_cooldown = 3  # секунды между запросами
+button_cooldown = 2  # секунды между нажатиями кнопок
+
+# Глобальный счетчик активных проверок
+active_checks = {}
+
+user_message_count = defaultdict(list)
 
 # Настройки логирования
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -54,6 +73,66 @@ broadcast_active = False  # По умолчанию выключена
 BROADCAST_CHAT_ID = -1002440915213  # ID чата для рассылки (InfinityAntiScam)
 BROADCAST_INTERVAL = 300
 
+
+# ФУНКЦИЯ ЗАЩИТЫ ОТ СПАМА ДЛЯ КНОПОК
+def check_button_spam_protection(user_id):
+    """Проверяет защиту от спама для кнопок"""
+    current_time = time.time()
+
+    # Инициализация данных пользователя
+    if user_id not in user_button_presses:
+        user_button_presses[user_id] = {
+            'count': 0,
+            'window_start': current_time,
+            'last_press': 0
+        }
+
+    user_data = user_button_presses[user_id]
+
+    # Сброс счетчика если окно времени истекло
+    if current_time - user_data['window_start'] > BUTTON_PRESS_WINDOW:
+        user_data['count'] = 0
+        user_data['window_start'] = current_time
+
+    # Проверка кулдауна между нажатиями
+    if current_time - user_data['last_press'] < BUTTON_COOLDOWN_TIME:
+        remaining = BUTTON_COOLDOWN_TIME - (current_time - user_data['last_press'])
+        return False, f"⏳ Подождите {remaining:.1f} секунд перед повторным нажатием"
+
+    # Проверка лимита нажатий в окне времени
+    if user_data['count'] >= MAX_BUTTON_PRESSES:
+        reset_time = BUTTON_PRESS_WINDOW - (current_time - user_data['window_start'])
+        return False, f"🚫 Слишком много нажатий! Подождите {reset_time:.1f} секунд"
+
+    # Обновляем данные пользователя
+    user_data['count'] += 1
+    user_data['last_press'] = current_time
+
+    return True, "OK"
+
+
+async def show_button_loading(event, button_name):
+    """Показывает сообщение о загрузке для кнопки"""
+    user_id = event.sender_id
+
+    # Показываем сообщение о загрузке
+    loading_text = f"🔄 Загружаем {button_name}..."
+    try:
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            except:
+                pass
+
+        loading_msg = await event.respond(loading_text)
+        button_loading_messages[user_id] = loading_msg.id
+
+        # Небольшая задержка для имитации загрузки
+        await asyncio.sleep(0.5)
+
+    except Exception as e:
+        logging.error(f"Ошибка показа загрузки: {e}")
+
 class Database:
     def __init__(self, db_name='Ice.db'):
         logging.info("Инициализация базы данных...")
@@ -61,142 +140,132 @@ class Database:
         self.conn = sqlite3.connect(db_name, isolation_level=None)
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.cursor = self.conn.cursor()
-        self.conn.row_factory = sqlite3.Row  # Преобразует результаты в словарь
+        self.conn.row_factory = sqlite3.Row
         self.lock = asyncio.Lock()
-        self.create_tables()  # Вызов метода для создания таблиц
-        self.check_table_structure()  # Проверка структуры таблицы
+        self.create_tables()
+        self.check_table_structure()
+        self.check_and_fix_database()
 
     def create_tables(self):
         logging.info("Проверка и создание таблиц если не существуют...")
 
-        # Таблица для рейтинга пользователей
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS user_ratings (
-                   user_id INTEGER PRIMARY KEY,
-                   total_rating REAL DEFAULT 5.0,
-                   rating_count INTEGER DEFAULT 1,
-                   average_rating REAL DEFAULT 5.0
-               )''')
+                       user_id INTEGER PRIMARY KEY,
+                       total_rating REAL DEFAULT 5.0,
+                       rating_count INTEGER DEFAULT 1,
+                       average_rating REAL DEFAULT 5.0
+                   )''')
         logging.info("Таблица user_ratings проверена/создана")
 
-        # Таблица для голосов (чтобы пользователь мог голосовать только раз)
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS user_votes (
-                   vote_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                   voter_id INTEGER NOT NULL,
-                   target_id INTEGER NOT NULL,
-                   vote_type TEXT NOT NULL, -- 'like' или 'dislike'
-                   vote_date TEXT DEFAULT CURRENT_TIMESTAMP,
-                   UNIQUE(voter_id, target_id)
-               )''')
+                       vote_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                       voter_id INTEGER NOT NULL,
+                       target_id INTEGER NOT NULL,
+                       vote_type TEXT NOT NULL,
+                       vote_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                       UNIQUE(voter_id, target_id)
+                   )''')
         logging.info("Таблица user_votes проверена/создана")
 
-
-        # Таблица пользователей
+        # УПРОЩЕННЫЙ ЗАПРОС БЕЗ КОММЕНТАРИЕВ
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            role_id INTEGER DEFAULT 0,
-            check_count INTEGER DEFAULT 0,
-            last_check_date TEXT,
-            country TEXT,
-            channel TEXT,
-            custom_photo TEXT,
-            custom_photo_url TEXT,
-            premium_points INTEGER DEFAULT 0,
-            description TEXT,
-            scammers_count INTEGER DEFAULT 0,
-            scammers_slept INTEGER DEFAULT 0,
-            warnings INTEGER DEFAULT 0,
-            role TEXT,
-            custom_status TEXT,
-            granted_by_id INTEGER,
-            curator_id INTEGER,
-            allowance INTEGER DEFAULT 0,
-            FOREIGN KEY(curator_id) REFERENCES users(user_id)
-        )''')
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                role_id INTEGER DEFAULT 0,
+                check_count INTEGER DEFAULT 0,
+                last_check_date TEXT,
+                country TEXT,
+                channel TEXT,
+                custom_photo TEXT,
+                custom_photo_url TEXT,
+                premium_points INTEGER DEFAULT 0,
+                description TEXT,
+                scammers_count INTEGER DEFAULT 0,
+                scammers_slept INTEGER DEFAULT 0,
+                warnings INTEGER DEFAULT 0,
+                role TEXT,
+                custom_status TEXT,
+                granted_by_id INTEGER,
+                curator_id INTEGER,
+                allowance INTEGER DEFAULT 0,
+                FOREIGN KEY(curator_id) REFERENCES users(user_id)
+            )''')
         logging.info("Таблица users проверена/создана")
 
-        # Таблица премиум пользователей
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS premium_users (
-            user_id INTEGER PRIMARY KEY,
-            expiry_date TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )''')
+                user_id INTEGER PRIMARY KEY,
+                expiry_date TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )''')
         logging.info("Таблица premium_users проверена/создана")
 
-        # Таблица проверок
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS checks (
-            check_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            checker_id INTEGER,
-            target_id INTEGER,
-            check_date TEXT,
-            description TEXT,
-            FOREIGN KEY(checker_id) REFERENCES users(user_id),
-            FOREIGN KEY(target_id) REFERENCES users(user_id)
-        )''')
+                check_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                checker_id INTEGER,
+                target_id INTEGER,
+                check_date TEXT,
+                description TEXT,
+                FOREIGN KEY(checker_id) REFERENCES users(user_id),
+                FOREIGN KEY(target_id) REFERENCES users(user_id)
+            )''')
         logging.info("Таблица checks проверена/создана")
 
-         #таблица скаммеров
         self.cursor.execute('DROP TABLE IF EXISTS scammers')
 
         self.cursor.execute('''CREATE TABLE scammers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER,
-                reason TEXT,
-                reported_by TEXT,
-                description TEXT,
-                reporter_id INTEGER,
-                scammer_id INTEGER,
-                extra_info TEXT,
-                unique_id VARCHAR(255),
-                proof_link TEXT,
-                added_date TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY(scammer_id) REFERENCES users(user_id)
-            )''')
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    reason TEXT,
+                    reported_by TEXT,
+                    description TEXT,
+                    reporter_id INTEGER,
+                    scammer_id INTEGER,
+                    extra_info TEXT,
+                    unique_id VARCHAR(255),
+                    proof_link TEXT,
+                    added_date TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(scammer_id) REFERENCES users(user_id)
+                )''')
         logging.info("Таблица scammers создана заново")
 
-        # Таблица статистики
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS statistics (
-            total_messages INTEGER DEFAULT 0
-        )''')
-        # Добавляем начальную запись только если таблица пустая
+                total_messages INTEGER DEFAULT 0
+            )''')
         self.cursor.execute('INSERT OR IGNORE INTO statistics (total_messages) VALUES (0)')
         logging.info("Таблица statistics проверена/создана")
 
-        # Таблица причин
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS reasons (
-            user_id INTEGER PRIMARY KEY,
-            reason TEXT
-        )''')
+                user_id INTEGER PRIMARY KEY,
+                reason TEXT
+            )''')
         logging.info("Таблица reasons проверена/создана")
 
-        # Таблица стажеров
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS trainees (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE
-        )''')
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE
+            )''')
         logging.info("Таблица trainees проверена/создана")
 
-        # Таблица сообщений
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS messages (
-            message_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-            content TEXT,
-            FOREIGN KEY(user_id) REFERENCES users(user_id)
-        )''')
+                message_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                content TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id)
+            )''')
         logging.info("Таблица messages проверена/создана")
 
-        # Таблица доверия
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS trust (
-            user_id INTEGER PRIMARY KEY,
-            granted_by INTEGER,
-            grant_date TEXT
-        )''')
+                user_id INTEGER PRIMARY KEY,
+                granted_by INTEGER,
+                grant_date TEXT
+            )''')
         logging.info("Таблица trust проверена/создана")
 
         self.conn.commit()
-        logging.info("Все таблицы проверены/созданы")
+
+        logging.info("Все таблицы проверены/создана")
 
 
     def check_table_structure(self):
@@ -205,6 +274,61 @@ class Database:
         columns = self.cursor.fetchall()
         for column in columns:
             print(column)  # Вывод структуры таблицы
+
+    def cooldown(seconds):
+        """Декоратор для защиты от спама"""
+
+        def decorator(func):
+            last_called = {}
+
+            @functools.wraps(func)
+            async def wrapper(event, *args, **kwargs):
+                user_id = event.sender_id
+                current_time = time.time()
+
+                if user_id in last_called:
+                    elapsed = current_time - last_called[user_id]
+                    if elapsed < seconds:
+                        remaining = seconds - elapsed
+                        await event.answer(f"⏳ Подождите {remaining:.1f} секунд", alert=False)
+                        return
+
+                last_called[user_id] = current_time
+                return await func(event, *args, **kwargs)
+
+            return wrapper
+
+        return decorator
+
+    def check_and_fix_database(self):
+        """Проверяет и добавляет недостающие столбцы в таблицу users"""
+        try:
+            # Проверяем существующие столбцы
+            self.cursor.execute("PRAGMA table_info(users)")
+            existing_columns = [column[1] for column in self.cursor.fetchall()]
+
+            # Столбцы, которые должны быть
+            required_columns = [
+                'scammers_count',
+                'premium_points',
+                'allowance'
+            ]
+
+            # Добавляем недостающие столбцы
+            for column in required_columns:
+                if column not in existing_columns:
+                    if column == 'scammers_count':
+                        self.cursor.execute(f"ALTER TABLE users ADD COLUMN {column} INTEGER DEFAULT 0")
+                    elif column == 'premium_points':
+                        self.cursor.execute(f"ALTER TABLE users ADD COLUMN {column} INTEGER DEFAULT 0")
+                    elif column == 'allowance':
+                        self.cursor.execute(f"ALTER TABLE users ADD COLUMN {column} INTEGER DEFAULT 0")
+                    logging.info(f"Добавлен столбец {column} в таблицу users")
+
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Ошибка при проверке/исправлении базы данных: {e}")
+
 
     def get_user_rating(self, user_id):
         """Получает рейтинг пользователя с ограничением от 2.0 до 10.0"""
@@ -380,6 +504,15 @@ class Database:
         except sqlite3.Error as e:
             print(f"Ошибка при выполнении запроса: {e}")  # Обработка ошибок
 
+    def increment_scammers_count_all_roles(self, user_id):
+        """Увеличивает счетчик скамеров для ЛЮБОЙ роли пользователя"""
+        try:
+            self.cursor.execute('UPDATE users SET scammers_count = scammers_count + 1 WHERE user_id = ?', (user_id,))
+            self.conn.commit()
+            logging.info(f"Счетчик скамеров увеличен для пользователя {user_id} (любая роль)")
+        except sqlite3.Error as e:
+            logging.error(f"Ошибка увеличения счетчика скамеров: {e}")
+
     def update_total_messages(self, count):
         try:
             logging.info("Обновление количества сообщений...")
@@ -406,9 +539,28 @@ class Database:
         return result[0] if result else None
 
     def increment_scammers_count(self, user_id):
-        """Увеличивает счетчик слитых скаммеров для пользователя с указанным user_id."""
-        self.cursor.execute("UPDATE users SET scammers_slept = scammers_slept + 1 WHERE user_id = ?", (user_id,))
-        self.conn.commit()
+        """Увеличивает общий счетчик скамеров для любого пользователя"""
+        try:
+            # Проверяем, есть ли столбец
+            self.cursor.execute("PRAGMA table_info(users)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+
+            if 'scammers_count' not in columns:
+                logging.error(f"Столбец scammers_count не найден!")
+                return False
+
+            # Получаем текущее значение
+            current = self.get_user_scammers_count(user_id)
+            new_count = current + 1
+
+            self.cursor.execute('UPDATE users SET scammers_count = ? WHERE user_id = ?', (new_count, user_id))
+            self.conn.commit()
+
+            logging.info(f"Общий счетчик скамеров для {user_id} увеличен: {current} -> {new_count}")
+            return True
+        except Exception as e:
+            logging.error(f"Ошибка увеличения общего счетчика для {user_id}: {e}")
+            return False
 
     def add_user(self, user_id, username, role_id=0):
         try:
@@ -661,6 +813,7 @@ class Database:
         self.cursor.execute("DELETE FROM reasons WHERE user_id = ?", (user_id,))
         self.conn.commit()
 
+
     def add_or_update_premium_user(self, user_id, expiry_date):
         try:
             existing_user = self.cursor.execute('SELECT * FROM premium_users WHERE user_id = ?', (user_id,)).fetchone()
@@ -830,9 +983,27 @@ class Database:
         self.conn.commit()
 
     def get_user_scammers_count(self, user_id):
-        self.cursor.execute('SELECT scammers_slept FROM users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        return result[0] if result else 0
+        """Получает общее количество занесенных скамеров для ЛЮБОЙ роли"""
+        try:
+            # Сначала проверяем, есть ли столбец
+            self.cursor.execute("PRAGMA table_info(users)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+
+            if 'scammers_count' not in columns:
+                logging.warning(f"Столбец scammers_count не найден в таблице users")
+                return 0
+
+            self.cursor.execute('SELECT scammers_count FROM users WHERE user_id = ?', (user_id,))
+            result = self.cursor.fetchone()
+            if result:
+                count = result[0] if result[0] is not None else 0
+                logging.info(f"Общий счетчик скамеров для {user_id}: {count}")
+                return count
+            logging.info(f"Пользователь {user_id} не найден, возвращаем 0")
+            return 0
+        except Exception as e:
+            logging.error(f"Ошибка получения общего счетчика скамеров для {user_id}: {e}")
+            return 0
 
     def update_user_scammers_count(self, user_id, new_count):
         """Обновляет количество слитых скаммеров для указанного пользователя."""
@@ -921,6 +1092,7 @@ class Database:
         except sqlite3.Error as e:
             logging.error(f"Ошибка при удалении статуса скамера для пользователя {user_id}: {e}")
             return False  # Возвращаем False, если произошла ошибка
+
 
     def set_user_allowance(self, user_id, amount):
         try:
@@ -1012,73 +1184,108 @@ ROLES = {
     13: {"name": "Айдош⭐", "preview_url": "https://i.ibb.co/xtQPhT16/image.jpg", "scam_chance": 20}
 }
 
+# Добавьте в начало файла после ROLES:
+
+# Все роли персонала базы (кто защищен от заноса)
+STAFF_ROLES = [1, 6, 7, 8, 9, 10, 11, 12, 13]  # Все персоналы + гаранты
+
+# Роли, которым разрешено заносить (все персоналы кроме некоторых)
+CAN_ADD_SCAMMER_ROLES = [1, 6, 7, 8, 9, 10, 11, 13]  # Все могут заносить, но...
+# 12 (Проверен гарантом) не может заносить
 
 async def check_user(event):
     global checks_count
     user_id = event.sender_id
     user = await event.get_sender()
-    loading_msg = await event.respond("ищу данные о пользователе в базе...🔍")
+
+    # ПРОВЕРКА НА СПАМ - первое что делаем
+    current_time = time.time()
+
+    # Проверяем, не выполняется ли уже проверка для этого пользователя
+    if user_id in active_checks and active_checks[user_id]:
+        await event.respond("⏳ Ваш предыдущий запрос еще обрабатывается...")
+        return
 
     # Проверяем время последнего вызова команды
-    current_time = time.time()
     if user_id in last_check_time:
         elapsed_time = current_time - last_check_time[user_id]
-        if elapsed_time < 5:
-            await loading_msg.delete()
-            remaining_time = 5 - elapsed_time
-            return await send_response(event,
-                                       f"⌚ перед повторной проверкой,прошу подождать {remaining_time:.1f} секунд(ы)!")
+        if elapsed_time < check_cooldown:
+            remaining_time = check_cooldown - elapsed_time
+            await event.respond(f"⏳ Подождите {remaining_time:.1f} секунд перед повторной проверкой!")
+            return
 
+    # Устанавливаем блокировку
+    active_checks[user_id] = True
     last_check_time[user_id] = current_time
-    await asyncio.sleep(0.5)
 
-    user_to_check = None
-    user_data = None
+    # Только теперь показываем загрузку
+    try:
+        loading_msg = await event.respond("🔍 Ищу данные о пользователе в базе...")
 
-    # Определяем пользователя для проверки
-    if event.reply_to_msg_id:
-        replied = await event.get_reply_message()
-        user_to_check = await event.client.get_entity(replied.sender_id)
-        user_data = db.get_user(user_to_check.id) if db else None
-    else:
-        if "чек себя" in event.raw_text.lower() or "чек ми" in event.raw_text.lower():
-            user_to_check = user
+        await asyncio.sleep(0.5)  # Минимальная задержка
+
+        user_to_check = None
+        user_data = None
+
+        # Определяем пользователя для проверки
+        if event.reply_to_msg_id:
+            replied = await event.get_reply_message()
+            user_to_check = await event.client.get_entity(replied.sender_id)
+            user_data = db.get_user(user_to_check.id) if db else None
         else:
-            try:
-                args = event.raw_text.split()[1:]
-                if args and args[0].isdigit():
-                    user_id_to_check = int(args[0])
-                    user_data = db.get_user(user_id_to_check) if db else None
-                    if user_data:
-                        # ИСПРАВЛЕНИЕ: создаем объект с атрибутом id
-                        user_to_check = type('obj', (object,), {'id': user_id_to_check})()
-                    else:
-                        await loading_msg.delete()
-                        return await send_response(event, "❌ | Пользователь не найден в базе данных.")
-                elif args:
-                    user_to_check = await event.client.get_entity(args[0])
-            except Exception as e:
-                logging.error(f"Ошибка при получении пользователя: {e}")
-                await loading_msg.delete()
-                return await send_response(event, "❌ | Не удалось найти пользователя.")
+            if "чек себя" in event.raw_text.lower() or "чек ми" in event.raw_text.lower():
+                user_to_check = user
+                user_data = db.get_user(user.id) if db else None
+            else:
+                try:
+                    args = event.raw_text.split()[1:]
+                    if args and args[0].isdigit():
+                        user_id_to_check = int(args[0])
+                        user_data = db.get_user(user_id_to_check) if db else None
 
-    # ИСПРАВЛЕНИЕ: Проверяем, что user_to_check не None
-    if user_to_check is None:
-        await loading_msg.delete()
-        return await send_response(event, "❌ | Не удалось определить пользователя.")
+                        if user_data:
+                            # Если пользователь есть в базе, создаем минимальный объект
+                            user_to_check = type('UserObject', (), {
+                                'id': user_id_to_check,
+                                'first_name': f"ID: {user_id_to_check}",
+                                'username': user_data[1] if len(user_data) > 1 and user_data[1] else None
+                            })()
+                        else:
+                            # ДОБАВЛЯЕМ ПОЛЬЗОВАТЕЛЯ С РОЛЬЮ 0, ЕСЛИ ЕГО НЕТ В БАЗЕ
+                            db.add_user(user_id_to_check, str(user_id_to_check), 0)
+                            user_data = db.get_user(user_id_to_check)
+                            # Создаем объект пользователя
+                            user_to_check = type('UserObject', (), {
+                                'id': user_id_to_check,
+                                'first_name': f"ID: {user_id_to_check}",
+                                'username': None
+                            })()
 
-    # Получаем данные, если они еще не загружены
-    if not user_data and db:
-        user_data = db.get_user(user_to_check.id)
+                    elif args:
+                        # Для юзернейма
+                        user_to_check = await event.client.get_entity(args[0])
+                        user_data = db.get_user(user_to_check.id) if db else None
+                except Exception as e:
+                    logging.error(f"Ошибка при получении пользователя: {e}")
+                    await loading_msg.delete()
+                    active_checks[user_id] = False
+                    return await send_response(event, "❌ | Не удалось найти пользователя.")
 
-    # ОТЛАДКА: выводим информацию о пользователе
-    logging.info(f"DEBUG: Проверка пользователя ID: {user_to_check.id}")
-    logging.info(f"DEBUG: Данные из базы: {user_data}")
-    if user_data:
-        logging.info(f"DEBUG: Роль из базы: {user_data[2]}")
-        logging.info(f"DEBUG: Тип роли: {type(user_data[2])}")
+        if user_to_check is None:
+            await loading_msg.delete()
+            active_checks[user_id] = False
+            return await send_response(event, "❌ | Не удалось определить пользователя.")
 
-    async with db:
+        # Получаем данные, если они еще не загружены
+        if not user_data and db:
+            # ДОБАВЛЯЕМ ПОЛЬЗОВАТЕЛЯ С РОЛЬЮ 0, ЕСЛИ ЕГО НЕТ В БАЗЕ
+            username = getattr(user_to_check, 'username', None) or getattr(user_to_check, 'first_name',
+                                                                           f"ID: {user_to_check.id}")
+            db.add_user(user_to_check.id, username, 0)
+            # Получаем обновленные данные
+            user_data = db.get_user(user_to_check.id)
+
+        # Увеличиваем счетчики проверок
         if db:
             db.increment_check_count(user_to_check.id)
         checks_count += 1
@@ -1106,10 +1313,18 @@ async def check_user(event):
                 buttons=Button.inline("↩Скрыть", b"hide_message")
             )
 
-    try:
+        # Удаляем сообщение о загрузке
         await loading_msg.delete()
+
     except Exception as e:
-        logging.error(f"Ошибка при удалении сообщения о загрузке: {e}")
+        logging.error(f"Ошибка в check_user: {e}")
+        try:
+            await loading_msg.delete()
+        except:
+            pass
+    finally:
+        # Снимаем блокировку в любом случае
+        active_checks[user_id] = False
 
 
 # Инициализация бота
@@ -1142,11 +1357,30 @@ async def members_menu(event):
     if not event.is_private:
         return
 
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "состав базы")
+
     buttons = [
         [Button.text("✅ Гаранты базы", resize=True)],
         [Button.text("👨‍🎓 Волонтёры базы", resize=True)],
         [Button.text("↩ Назад", resize=True)]
     ]
+
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
 
     await event.respond(
         "👥 **Меню состава базы**\n\n"
@@ -1155,20 +1389,52 @@ async def members_menu(event):
         parse_mode='md'
     )
 
+
 @bot.on(events.NewMessage(pattern="↩ Назад"))
 async def back_to_main(event):
     if not event.is_private:
         return
+
+    user_id = event.sender_id
+
+    # Проверка защиты от спама (но менее строгая для кнопки Назад)
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "главное меню")
+
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
 
     await event.respond(
         "Главное меню:",
         buttons=main_buttons
     )
 
+
 @bot.on(events.NewMessage(pattern="📊 Статистика базы"))
 async def statistics(event):
     if not event.is_private:
         return
+
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "статистику")
 
     # Получаем статистические данные
     user = await event.get_sender()
@@ -1208,6 +1474,14 @@ async def statistics(event):
         [Button.inline("😎 Топ Активных", b"top_day")],
         [Button.url("🎇 Наша База", 'https://t.me/Infinityantiscam')]
     ]
+
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
 
     stat_message = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
 
@@ -1506,14 +1780,22 @@ async def get_user_profile_response(event, user, user_data):
 
     logging.info(f"Проверка профиля для user_id: {user_id}, role_id: {role_id}")
 
-    country = user_data[5].strip() if user_data and len(user_data) > 5 and user_data[5] else "❓"
-    channel = user_data[6].strip() if user_data and len(user_data) > 6 and user_data[6] else "❓"
+    # Получаем данные пользователя из user_data или базы
+    if user_data:
+        country = user_data[5].strip() if len(user_data) > 5 and user_data[5] else "❓"
+        channel = user_data[6].strip() if len(user_data) > 6 and user_data[6] else "❓"
+    else:
+        country = "❓"
+        channel = "❓"
+
     description = db.get_user_description(user_id) or "Нет описания"
     checks_count = db.get_check_count(user_id)
     logging.info(f"Количество проверок для user_id {user_id} после увеличения: {checks_count}")
 
+    # Получаем общий счетчик скамеров
+    scammers_count = db.get_user_scammers_count(user_id)
     scammers_slept = db.get_user_scammers_slept(user_id)
-    custom_image_url = db.get_user_custom_photo_url(user_id)
+
     logging.info(f"Custom image URL retrieved for user {user_id}: {custom_image_url}")
 
     current_time = datetime.now().strftime("%d.%m.%Y")
@@ -1524,17 +1806,23 @@ async def get_user_profile_response(event, user, user_data):
         rating_display = f"{rating_stars} {user_rating:.1f}/10"
     except Exception as e:
         logging.error(f"Ошибка получения рейтинга для {user_id}: {e}")
-        rating_display = "⭐ 5.0/10"  # Значение по умолчанию
+        rating_display = "⭐ 5.0/10"
 
-    # Получаем имя пользователя (если это канал, используем title)
-    if hasattr(user, 'first_name'):
+    # Получаем имя пользователя для отображения
+    if hasattr(user, 'first_name') and user.first_name:
         user_name = user.first_name
-    elif hasattr(user, 'title'):
+    elif hasattr(user, 'title') and user.title:
         user_name = user.title
-    elif hasattr(user, 'username'):
+    elif hasattr(user, 'username') and user.username:
         user_name = f"@{user.username}"
     else:
         user_name = f"ID: {user.id}"
+
+
+    if hasattr(user, 'username') and user.username:
+        profile_url = f"https://t.me/{user.username}"
+    else:
+        profile_url = f"tg://user?id={user.id}"
 
     # Получаем все записи о скамере для отображения в профиле
     scammer_details = ""
@@ -1569,11 +1857,12 @@ async def get_user_profile_response(event, user, user_data):
                 scammer_details += f"   👮 **Занес:** {reported_by}\n"
                 scammer_details += f"   📅 **Дата:** {formatted_date}\n\n"
 
+
+    profile_url = f"tg://user?id={user.id}"
     buttons = [
         [
-            Button.url("🎧 Профиль", f"https://t.me/{user.username}" if hasattr(user,
-                                                                               'username') and user.username else f"tg://user?id={user.id}"),
-            Button.inline("⚖️ Аппеляция", f"appeal_{user_id}".encode())
+            Button.url("🎧 Профиль", profile_url),
+            Button.inline("⚖️ Апелляция", f"appeal_{user_id}".encode())
         ],
         [
             Button.inline("🚫 Слить скаммера", f"sliv_scammers_{user_id}".encode()),
@@ -1581,7 +1870,7 @@ async def get_user_profile_response(event, user, user_data):
         ]
     ]
 
-    # Добавляем кнопку "вынести из базы" для скамеров и подозреваемых
+
     if role_id in [2, 3, 4, 5]:  # Возможно скамер, Скамер, Петух, Подозрение на скам
         buttons.append([Button.inline("🚫 Вынести из базы", f"remove_from_db_{user_id}".encode())])
 
@@ -1591,11 +1880,11 @@ async def get_user_profile_response(event, user, user_data):
 
     message_text = ""
 
-    random_emoji = random.choice(emojis) if country == "Не указана" else ""
+    random_emoji = random.choice(emojis) if country == "❓" else ""
 
-    country_display = f"[Не указана](https://telegra.ph/Kak-ustanovit-stranu-v-bote-05-29)" if country == "Не указана" else country
+    country_display = f"[Не указана](https://telegra.ph/Kak-ustanovit-stranu-v-bote-05-29)" if country == "❓" else country
 
-    granted_by_id = db.get_granted_by(user.id)
+    granted_by_id = db.get_granted_by(user.id) if hasattr(user, 'id') else None
     logging.info(f"Получен ID гаранта: {granted_by_id}")
 
     granted_by_username = "Неизвестный гарант"
@@ -1612,8 +1901,19 @@ async def get_user_profile_response(event, user, user_data):
     else:
         logging.warning("granted_by_id равен None, гарант не найден.")
 
+
+    theme_url = ROLES.get(role_id, {}).get('preview_url', '')
+
+
+    if not theme_url:
+        theme_url = "https://i.ibb.co/ycyPRXrb/photo-2025-04-17-17-44-20-2.jpg"  # Стандартная картинка
+
+    theme_preview = f"{theme_url}\n\n"
+
+    # ============ ФОРМИРОВАНИЕ ТЕКСТА ПО РОЛЯМ ============
+
     if role_id == 0:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url =ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[❌] Статус: не найден в базе. Риск скама: **44%**\n"
@@ -1625,7 +1925,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 12:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[❌] Статус: Проверен(а) гарантом | [ {granted_by_username} ](tg://user?id={granted_by_id}) ✅\n"
@@ -1637,7 +1937,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 1:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[✅] Статус: Гарант\n"
@@ -1649,7 +1949,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 10:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[💢] Статус: Владелец\n"
@@ -1661,7 +1961,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 9:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🧿] Статус: Президент\n"
@@ -1674,7 +1974,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 4:  # Петух
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🐓] Статус: Петух\n\n"
@@ -1687,7 +1987,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 3:  # Скамер
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🛑] Статус: Скаммер\n\n"
@@ -1700,7 +2000,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 7:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🔍] Статус: Админ\n"
@@ -1713,7 +2013,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 5:  # Подозрения на скам
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🛑] Статус: Подозрения На Скам\n\n"
@@ -1726,7 +2026,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 2:  # Возможно скамер
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🛑] Статус: Возможно скаммер\n\n"
@@ -1739,7 +2039,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 6:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[👨‍🎓] Статус: Стажер\n"
@@ -1753,7 +2053,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 8:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[‍🎩] Статус: Директор\n"
@@ -1767,7 +2067,7 @@ async def get_user_profile_response(event, user, user_data):
         )
 
     elif role_id == 11:
-        preview_url = custom_image_url if custom_image_url else ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[👨‍💻] Статус: Кодер\n"
@@ -1781,7 +2081,8 @@ async def get_user_profile_response(event, user, user_data):
         )
     else:
         logging.warning(f"Неизвестная роль: {role_id}")
-        return "❌ Неизвестная роль"
+        message_text = "❌ Неизвестная роль"
+        return message_text, buttons
 
     return message_text, buttons
 
@@ -1790,7 +2091,6 @@ async def get_user_profile_response(event, user, user_data):
 async def handler(event):
     user = event.sender  # Получаем пользователя, который отправил сообщение
     user_data = db.get_user_data(user.id)  # Получаем данные пользователя из базы
-    await send_user_profile(event, user, user_data)
 
 
 async def send_response(event, response_text, buttons=None):
@@ -1821,70 +2121,121 @@ def reset_cache():
     logging.info('Кэш успешно сброшен.')
 
 
-
 @bot.on(events.NewMessage(pattern=r'(?i)^(чек|чек ми|чек я|чек себя|check|/check).*'))
+@Database.cooldown(3)
 async def check_user(event):
-    global checks_count  # Убедитесь, что checks_count объявлена глобальной
+    global checks_count
     user_id = event.sender_id
     user = await event.get_sender()
-    loading_msg = await event.respond("ищу данные о пользователе в базе...🔍")
 
-    # Проверяем время последнего вызова команды
+    # Проверка на спам
     current_time = time.time()
+
+    # Проверяем, не выполняется ли уже проверка
+    if user_id in active_checks and active_checks[user_id]:
+        await event.respond("⏳ Ваш предыдущий запрос еще обрабатывается...")
+        return
+
+    # Проверяем время последнего вызова
     if user_id in last_check_time:
         elapsed_time = current_time - last_check_time[user_id]
-        if elapsed_time < 5:  # Если прошло меньше 5 секунд
-            await loading_msg.delete()
-            remaining_time = 5 - elapsed_time
-            return await send_response(event, f"⌚ перед повторной проверкой,прошу подождать {remaining_time:.1f} секунд(ы)!")
+        if elapsed_time < check_cooldown:
+            remaining_time = check_cooldown - elapsed_time
+            await event.respond(f"⏳ Подождите {remaining_time:.1f} секунд перед повторной проверкой!")
+            return
 
-    # Обновляем время последнего вызова команды
+    # Устанавливаем блокировку
+    active_checks[user_id] = True
     last_check_time[user_id] = current_time
 
-    # Задержка на 0.5 секунды
-    await asyncio.sleep(0.5)
+    loading_msg = None
+    try:
+        loading_msg = await event.respond("🔍 Ищу данные о пользователе в базе...")
+        await asyncio.sleep(0.5)
 
-    # Инициализация переменных
-    user_to_check = None
-    user_data = None  # Инициализация переменной для данных пользователя
+        user_to_check = None
+        user_data = None
 
-    # Определяем пользователя для проверки
-    if event.reply_to_msg_id:  # Если команда вызвана ответом на сообщение
-        replied = await event.get_reply_message()
-        user_to_check = await event.client.get_entity(replied.sender_id)
-        user_data = db.get_user(user_to_check.id) if db else None  # Получаем данные из БД
-    else:
-        if "чек себя" in event.raw_text.lower() or "чек ми" in event.raw_text.lower():
-            user_to_check = user
-        else:
+        # Определяем пользователя для проверки
+        if event.reply_to_msg_id:
+            replied = await event.get_reply_message()
             try:
-                args = event.raw_text.split()[1:]
-                if args and args[0].isdigit():  # Проверка по ID
-                    user_id_to_check = int(args[0])
-                    user_data = db.get_user(user_id_to_check) if db else None  # Получаем данные из БД
-                    if user_data:
-                        user_to_check = user_data  # Присваиваем данные пользователя
-                    else:
-                        await loading_msg.delete()
-                        return await send_response(event, "❌ | Пользователь не найден в базе данных.")
-                elif args:  # Проверка по юзернейму
-                    user_to_check = await event.client.get_entity(args[0])
+                user_to_check = await event.client.get_entity(replied.sender_id)
+                user_data = db.get_user(user_to_check.id) if db else None
             except Exception as e:
-                logging.error(f"Ошибка при получении пользователя: {e}")
                 await loading_msg.delete()
-                return await send_response(event, "❌ | Не удалось найти пользователя.")
+                active_checks[user_id] = False
+                return await send_response(event, "❌ | Не удалось получить информацию о пользователе.")
+        else:
+            text_lower = event.raw_text.lower()
+            if any(keyword in text_lower for keyword in ["чек ми", "чек я", "чек себя", "check me"]):
+                user_to_check = user
+                user_data = db.get_user(user.id) if db else None
+            else:
+                # Парсим аргументы
+                args = event.raw_text.split()
+                if len(args) > 1:
+                    target = args[1].strip()
 
-    if user_to_check is None:
-        await loading_msg.delete()
-        return await send_response(event, "❌ | Не удалось определить пользователя.")
+                    try:
+                        # Пытаемся получить пользователя из Telegram
+                        if target.isdigit():
+                            # Для ID сначала пытаемся получить через get_entity
+                            try:
+                                user_to_check = await event.client.get_entity(int(target))
+                            except:
+                                # Если не получается, проверяем в базе данных
+                                user_id_to_check = int(target)
+                                user_data = db.get_user(user_id_to_check)
+                                if user_data:
+                                    # Создаем минимальный объект с данными из базы
+                                    user_to_check = type('UserObject', (), {
+                                        'id': user_id_to_check,
+                                        'first_name': f"ID: {user_id_to_check}",
+                                        'username': user_data[1] if len(user_data) > 1 and user_data[1] else None
+                                    })()
+                                else:
+                                    # ДОБАВЛЯЕМ ПОЛЬЗОВАТЕЛЯ С РОЛЬЮ 0, ЕСЛИ ЕГО НЕТ В БАЗЕ
+                                    db.add_user(user_id_to_check, str(user_id_to_check), 0)
+                                    user_data = db.get_user(user_id_to_check)
+                                    user_to_check = type('UserObject', (), {
+                                        'id': user_id_to_check,
+                                        'first_name': f"ID: {user_id_to_check}",
+                                        'username': None
+                                    })()
+                        else:
+                            # Для юзернейма
+                            if target.startswith('@'):
+                                target = target[1:]
+                            user_to_check = await event.client.get_entity(target)
 
-    # Получаем данные, если они еще не загружены
-    if not user_data and db:
-        user_data = db.get_user(user_to_check.id)
+                        # Получаем данные из базы
+                        user_data = db.get_user(user_to_check.id) if db and user_to_check else None
 
-    async with db:
+                    except Exception as e:
+                        logging.error(f"Ошибка при получении пользователя: {e}")
+                        await loading_msg.delete()
+                        active_checks[user_id] = False
+                        return await send_response(event, "❌ | Не удалось найти пользователя.")
+                else:
+                    # Если нет аргументов, проверяем себя
+                    user_to_check = user
+                    user_data = db.get_user(user.id) if db else None
+
+        if user_to_check is None:
+            await loading_msg.delete()
+            active_checks[user_id] = False
+            return await send_response(event, "❌ | Не удалось определить пользователя.")
+
+        # Получаем данные, если они еще не загружены
+        if not user_data and db:
+            # ДОБАВЛЯЕМ ПОЛЬЗОВАТЕЛЯ С РОЛЬЮ 0, ЕСЛИ ЕГО НЕТ В БАЗЕ
+            username = getattr(user_to_check, 'username', None) or getattr(user_to_check, 'first_name', f"ID: {user_to_check.id}")
+            db.add_user(user_to_check.id, username, 0)
+            user_data = db.get_user(user_to_check.id)
+
         # Увеличиваем счетчики проверок
-        if db:
+        if db and user_to_check:
             db.increment_check_count(user_to_check.id)
         checks_count += 1
 
@@ -1911,11 +2262,21 @@ async def check_user(event):
                 buttons=Button.inline("↩Скрыть", b"hide_message")
             )
 
-    # Удаляем сообщение о загрузке
-    try:
-        await loading_msg.delete()
+        # Удаляем сообщение о загрузке
+        if loading_msg:
+            await loading_msg.delete()
+
     except Exception as e:
-        logging.error(f"Ошибка при удалении сообщения о загрузке: {e}")
+        logging.error(f"Ошибка в check_user: {e}")
+        try:
+            if loading_msg:
+                await loading_msg.delete()
+        except:
+            pass
+    finally:
+        # Снимаем блокировку
+        if user_id in active_checks:
+            active_checks[user_id] = False
 
 
 @bot.on(events.NewMessage(pattern=r'(?i)^/on$'))
@@ -2095,6 +2456,25 @@ async def my_curator_command(event):
         )
     except:
         await event.respond(f"👨‍🏫 **Ваш куратор:** ID {curator_id}")
+
+
+# Функция для периодической очистки старых данных о нажатиях
+async def cleanup_old_button_data():
+    """Очищает старые данные о нажатиях кнопок"""
+    while True:
+        await asyncio.sleep(3600)  # Каждый час
+        current_time = time.time()
+        to_remove = []
+
+        for user_id, data in user_button_presses.items():
+            if current_time - data['window_start'] > BUTTON_PRESS_WINDOW * 2:  # Двойное окно времени
+                to_remove.append(user_id)
+
+        for user_id in to_remove:
+            del user_button_presses[user_id]
+
+        logging.info(f"Очищены данные о нажатиях для {len(to_remove)} пользователей")
+
 
 @bot.on(events.NewMessage(pattern=r'(?i)^(выговор|/выговор)'))
 async def warning_handler(event):
@@ -2304,50 +2684,54 @@ async def thank_command(event):
 
     # Проверка роли пользователя, который вызывает команду
     user_role = db.get_user_role(user_id)
-    logging.info(f"Роль пользователя {user_id}: {user_role}")
-    allowed_roles = [6, 8, 10, 11, 9, 13]  # Стажёр=6, Директор=8, Создатель=10, Кодер=1, Президент=9
+    allowed_roles = [6, 8, 10, 11, 9, 13]
 
-    # Если у пользователя нет прав, просто выходим из функции
     if user_role not in allowed_roles:
         return
 
-    # Получаем ID пользователя, которому будет выдано +1 слитого скаммера
     if event.reply_to_msg_id:
         reply_message = await event.get_reply_message()
         target_user_id = reply_message.sender_id
 
-        # Проверяем, что у пользователя роль не 0 (разрешаем выдачу +спасибо пользователям с ролью 0)
-        target_user_role = db.get_user_role(target_user_id)
-        logging.info(f"Роль целевого пользователя {target_user_id}: {target_user_role}")
+        # Увеличиваем ОБЩИЙ счетчик скамеров
+        db.increment_scammers_count(target_user_id)
 
-        # Условие, чтобы разрешить выдачу +спасибо пользователям с ролью 0
-        if target_user_role in [1, 6, 8, 9, 10, 11, 13]:
-            return  # Если роль целевого пользователя запрещает выдачу, просто выходим
+        # Также увеличиваем счетчик для персонала (scammers_slept)
+        target_role = db.get_user_role(target_user_id)
+        if target_role in [6, 7, 8, 9, 10, 11, 13]:
+            db.increment_scammers_count_all_roles(target_user_id)  # старый метод
 
-    # Увеличиваем счетчик слитых скаммеров
-    try:
-        db.increment_scammers_count(target_user_id)  # Метод для увеличения счетчика
-        await event.respond(
-            f"📛 пользователю с ID: {target_user_id} выдано +спасибо.\n\n"
-            "📈 Спасибо, что боретесь со скамом вместе с Infinity [ ] (https://i.ibb.co/HDc1Bwpr/photo-2025-04-17-17-44-20-4.jpg).\n\n"
-            "☕ Если у вас есть ещё скаммеры, сообщите об этом нашим стажёрам или администраторам, и они занесут скаммера в базу!"
-        )
-    except Exception as e:
-        logging.error(f"Ошибка при увеличении счетчика слитых скаммеров: {str(e)}")
-        await event.respond("❌ Произошла ошибка при увеличении счетчика слитых скаммеров.")
+        # Получаем обновленный счетчик
+        new_count = db.get_user_scammers_count(target_user_id)
 
-# Словарь для отслеживания сообщений
-user_message_count = defaultdict(list)
+        try:
+            sender = await event.get_sender()
+            target_user = await bot.get_entity(target_user_id)
+
+            await event.respond(
+                f"📛 Пользователю [{target_user.first_name}](tg://user?id={target_user_id}) выдано +спасибо.\n\n"
+                f"👤 Выдал: [{sender.first_name}](tg://user?id={user_id})\n"
+                f"🔥 **Общий счетчик скамеров:** {new_count}\n\n"
+                f"📈 Спасибо, что боретесь со скамом вместе с Infinity!",
+                parse_mode='md'
+            )
+        except:
+            await event.respond(f"✅ +спасибо выдано пользователю с ID: {target_user_id}\n🔥 Общий счетчик: {new_count}")
+    else:
+        await event.respond("❌ Ответьте на сообщение пользователя, которому хотите выдать +спасибо.")
 
 
-
-@bot.on(events.NewMessage)
+@bot.on(events.NewMessage())
 async def message_handler(event):
     user_id = event.sender_id
 
     # Игнорируем сообщения от ботов
     if event.sender.bot:
         return
+
+    # ПРОВЕРКА: только для групп/супергрупп
+    if not event.is_group and not event.is_channel:
+        return  # Игнорируем личные сообщения
 
     # Получаем текущее время
     current_time = datetime.now()
@@ -2361,25 +2745,29 @@ async def message_handler(event):
 
     # Проверяем количество сообщений
     if len(user_message_count[user_id]) > 8:
-        # Выдаём мут на 10 минут
-        await bot.edit_permissions(
-            event.chat_id,
-            user_id,
-            until_date=current_time + timedelta(minutes=10),
-            send_messages=False,
-            send_media=False,
-            send_stickers=False,
-            send_gifs=False,
-            send_games=False,
-            send_inline=False
-        )
+        try:
+            # Выдаём мут на 10 минут (ТОЛЬКО В ГРУППАХ)
+            await bot.edit_permissions(
+                event.chat_id,
+                user_id,
+                until_date=current_time + timedelta(minutes=10),
+                send_messages=False,
+                send_media=False,
+                send_stickers=False,
+                send_gifs=False,
+                send_games=False,
+                send_inline=False
+            )
 
-        await event.respond(f"🔇 Пользователь {event.sender.first_name} был замучен за спам на 10 минут!")
-        logging.info(f"Пользователь {user_id} замучен за спам.")
+            await event.respond(f"🔇 Пользователь {event.sender.first_name} был замучен за спам на 10 минут!")
+            logging.info(f"Пользователь {user_id} замучен за спам.")
 
-        # Очищаем записи сообщений после мута
-        del user_message_count[user_id]
+            # Очищаем записи сообщений после мута
+            del user_message_count[user_id]
 
+        except Exception as e:
+            logging.error(f"Ошибка при выдаче мута: {e}")
+            # Игнорируем ошибки, не прерываем работу бота
 
 # Глобальные переменные
 games = {}
@@ -2544,8 +2932,20 @@ async def support_handler(event):
         parse_mode='md'
     )
 
+
 @bot.on(events.NewMessage(pattern="❓ Частые вопросы"))
 async def faq_handler(event):
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "частые вопросы")
+
     query = event.raw_text
     faq_buttons = [
         [Button.inline("Кто такой гарант?", "who_is_guarantee")],
@@ -2558,6 +2958,14 @@ async def faq_handler(event):
         [Button.inline("Можно ли купить снятие из базы?", "buy_removal")],
         [Button.inline("Вернуться ↩", "back_to_main")]
     ]
+
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
 
     await event.respond("Выберите нужный вам пункт:[⠀](https://i.ibb.co/q3bGLp9J/image.png)", buttons=faq_buttons)
 
@@ -3480,10 +3888,10 @@ async def scam_command(event):
     user_id = event.sender_id
 
     user_role = db.get_user_role(user_id)
-    allowed_roles = [6, 7, 8, 9, 10, 11, 13]  # Стажёр, Админ, Директор, Президент, Владелец, Кодер, Айдош
 
-    if user_role not in allowed_roles:
-        await event.respond("❌ У вас нет прав для использования этой команды")
+    # Проверяем, может ли пользователь заносить
+    if user_role not in CAN_ADD_SCAMMER_ROLES:
+        await event.respond("❌ Только персонал базы может заносить скамеров!")
         return
 
     args = event.raw_text.split(maxsplit=2)
@@ -3503,33 +3911,60 @@ async def scam_command(event):
         proof_link = full_reason
         reason = "Без подробного описания"
 
-    logging.info(
-        f"Пользователь {user_id} (роль: {user_role}) пытается добавить скамера: {target}, причина: {reason}, доказательства: {proof_link}")
+    logging.info(f"Пользователь {user_id} (роль: {user_role}) пытается добавить скамера: {target}")
 
     try:
+        scammer_user = None
+        # Проверка по ID
         if target.isdigit():
-            user = await event.client.get_entity(int(target))
+            user_id_to_check = int(target)
+            # Пытаемся получить пользователя из Telegram
+            try:
+                scammer_user = await event.client.get_entity(user_id_to_check)
+            except:
+                # Если не можем получить из Telegram, создаем фейковый объект
+                scammer_user = type('UserObject', (), {
+                    'id': user_id_to_check,
+                    'first_name': f"ID: {user_id_to_check}"
+                })()
         else:
+            # Проверка по юзернейму
             if target.startswith('@'):
                 target = target[1:]
-            user = await event.client.get_entity(target)
+            scammer_user = await event.client.get_entity(target)
+
     except Exception as e:
         await event.respond("❌ Не могу найти пользователя")
         logging.error(f"Ошибка при получении пользователя: {e}")
         return
 
-    # Получаем имя пользователя (если это канал, используем title)
-    if hasattr(user, 'first_name'):
-        scammer_name = user.first_name
-    elif hasattr(user, 'title'):
-        scammer_name = user.title
+    # Проверяем, является ли целевой пользователь персоналом?
+    scammer_role = db.get_user_role(scammer_user.id)
+
+    if scammer_role in STAFF_ROLES:
+        scammer_role_name = ROLES.get(scammer_role, {}).get('name', 'Неизвестно')
+        user_role_name = ROLES.get(user_role, {}).get('name', 'Неизвестно')
+
+        await event.respond(
+            f"🚫 **ЗАПРЕЩЕНО ЗАНОСИТЬ ПЕРСОНАЛ!**\n\n"
+            f"👤 **Вы:** {user_role_name}\n"
+            f"🎯 **Пытаетесь занести:** {scammer_role_name}\n\n"
+            f"❌ Персонал базы Infinity не может быть занесен в базу скамеров!"
+        )
+        return
+
+    # Получаем имя пользователя
+    if hasattr(scammer_user, 'first_name'):
+        scammer_name = scammer_user.first_name
+    elif hasattr(scammer_user, 'title'):
+        scammer_name = scammer_user.title
     else:
-        scammer_name = f"ID: {user.id}"
+        scammer_name = f"ID: {scammer_user.id}"
 
     # Сохраняем временные данные о заносе
     unique_id = str(uuid.uuid4())
     TEMP_STORAGE[unique_id] = {
-        'scammer_id': user.id,
+        'scammer_id': scammer_user.id,
         'scammer_name': scammer_name,
         'user_id': user_id,
         'user_name': (await event.get_sender()).first_name,
@@ -3541,7 +3976,7 @@ async def scam_command(event):
         'selected_role_name': None
     }
 
-    # Для стажёров показываем окно выбора роли (отправляется куратору)
+    # Для стажёров показываем окно выбора роли
     if user_role == 6:  # Стажёр
         buttons = [
             [Button.inline("🐓 Петух", f"select_role_petuh_{unique_id}".encode()),
@@ -3552,6 +3987,7 @@ async def scam_command(event):
 
         await event.respond(
             f"Выберите роль для скамера {scammer_name}:\n\n"
+            f"📋 **Проверка:** Целевой пользователь НЕ является персоналом базы ✅\n"
             f"🐓 **Петух** - пользователь с плохой репутацией\n"
             f"❌ **Скамер** - доказанный мошенник\n"
             f"⚠️ **Подозрения на скам** - есть подозрения\n"
@@ -3561,7 +3997,7 @@ async def scam_command(event):
             buttons=buttons
         )
     else:
-        # Для остальных ролей (админы и выше) сразу показываем окно выбора роли (прямой занос)
+        # Для остального персонала сразу показываем окно выбора роли
         buttons = [
             [Button.inline("🐓 Петух", f"direct_role_petuh_{unique_id}".encode()),
              Button.inline("❌ Скамер", f"direct_role_scammer_{unique_id}".encode())],
@@ -3571,6 +4007,7 @@ async def scam_command(event):
 
         await event.respond(
             f"Выберите роль для скамера {scammer_name}:\n\n"
+            f"📋 **Проверка:** Целевой пользователь НЕ является персоналом базы ✅\n"
             f"🐓 **Петух** - пользователь с плохой репутацией\n"
             f"❌ **Скамер** - доказанный мошенник\n"
             f"⚠️ **Подозрения на скам** - есть подозрения\n"
@@ -3611,9 +4048,25 @@ async def process_trainee_role_selection(event, role_id, role_name):
 
     scam_data = TEMP_STORAGE[unique_id]
 
-    # ЗАЩИТА: проверяем, что нажимает тот же пользователь
+    # Двойная проверка: что нажимает тот же пользователь
     if event.sender_id != scam_data['user_id']:
         await event.answer("❌ Вы не можете нажимать на чужие кнопки", alert=True)
+        return
+
+    # ПОВТОРНАЯ ПРОВЕРКА: является ли скамер персоналом
+    scammer_role = db.get_user_role(scam_data['scammer_id'])
+    if scammer_role in STAFF_ROLES:
+        scammer_role_name = ROLES.get(scammer_role, {}).get('name', 'Неизвестно')
+
+        await event.edit(
+            f"🚫 **ОШИБКА!**\n\n"
+            f"❌ Нельзя заносить персонал базы!\n"
+            f"👤 **Целевой пользователь:** {scam_data['scammer_name']}\n"
+            f"🎯 **Роль:** {scammer_role_name}\n\n"
+            f"ℹ️ Персонал Infinity не может быть занесен в базу скамеров.\n"
+            f"Если у вас есть жалобы на персонал, обратитесь к создателю базы.",
+            buttons=None
+        )
         return
 
     # Сохраняем выбранную роль
@@ -3749,6 +4202,31 @@ async def direct_role_possible_handler(event):
 async def process_direct_role_selection(event, unique_id, role_id, role_name):
     scam_data = TEMP_STORAGE[unique_id]
 
+    # Проверка, что нажимает тот же пользователь
+    if event.sender_id != scam_data['user_id']:
+        await event.answer("❌ Вы не можете нажимать на чужие кнопки", alert=True)
+        return
+
+    # ПРОВЕРКА: является ли скамер персоналом
+    scammer_role = db.get_user_role(scam_data['scammer_id'])
+    if scammer_role in STAFF_ROLES:
+        scammer_role_name = ROLES.get(scammer_role, {}).get('name', 'Неизвестно')
+        user_role_name = ROLES.get(scam_data['user_role'], {}).get('name', 'Неизвестно')
+
+        await event.edit(
+            f"🚫 **ЗАПРЕЩЕНО!**\n\n"
+            f"👤 **Вы:** {user_role_name}\n"
+            f"🎯 **Цель:** {scammer_role_name}\n\n"
+            f"❌ Нельзя заносить персонал базы Infinity!\n"
+            f"📋 Защищенные роли:\n"
+            f"• Гаранты (1) 🛡️\n• Стажёры (6) 🎓\n• Админы (7) 👮\n"
+            f"• Директора (8) 👔\n• Президенты (9) 👑\n• Владельцы (10) ⭐\n"
+            f"• Кодеры (11) 💻\n• Проверенные (12) ✅\n• Айдош (13) ⭐\n\n"
+            f"ℹ️ Если у вас есть жалобы на персонал, обратитесь к создателю базы.",
+            buttons=None
+        )
+        return
+
     try:
         # Добавляем пользователя если его нет
         if not db.get_user(scam_data['scammer_id']):
@@ -3768,8 +4246,8 @@ async def process_direct_role_selection(event, unique_id, role_id, role_name):
         )
 
         if scammer_added:
-            # Увеличиваем счётчик слитых скаммеров у пользователя (если это персонал)
-            if scam_data['user_role'] in [6, 7, 8, 9, 10, 11, 13]:
+            # Увеличиваем счётчик слитых скамеров у пользователя
+            if scam_data['user_role'] in STAFF_ROLES:
                 current_count = db.get_user_scammers_count(scam_data['user_id'])
                 new_count = current_count + 1
                 db.update_user_scammers_count(scam_data['user_id'], new_count)
@@ -3814,6 +4292,51 @@ async def process_direct_role_selection(event, unique_id, role_id, role_name):
         await event.answer("❌ Произошла ошибка при заносе", alert=True)
 
 
+@bot.on(events.CallbackQuery)
+async def callback_handler(event):
+    """Глобальный обработчик callback с защитой от спама"""
+    user_id = event.sender_id
+    current_time = time.time()
+
+    # Проверка на спам кнопками
+    if user_id in last_button_click:
+        elapsed_time = current_time - last_button_click[user_id]
+        if elapsed_time < button_cooldown:
+            # Показываем всплывающее уведомление
+            await event.answer(f"⏳ Подождите {button_cooldown - elapsed_time:.1f} секунд", alert=False)
+            return
+
+    # Обновляем время последнего клика
+    last_button_click[user_id] = current_time
+
+    # Обработка конкретных callback
+    try:
+        # Проверяем, какой callback пришел
+        data = event.data.decode('utf-8') if isinstance(event.data, bytes) else event.data
+
+        if data.startswith('rate_user_'):
+            await rate_user_handler(event)
+        elif data.startswith('vote_'):
+            await vote_handler(event)
+        elif data.startswith('appeal_'):
+            await appeal_handler(event)
+        elif data.startswith('sliv_scammers_'):
+            await sliv_scammers_handler(event)
+        elif data.startswith('remove_from_db_'):
+            await remove_from_db_handler(event)
+        elif data == 'hide_message':
+            await hide_message_handler(event)
+        elif data == 'top_trainees':
+            await top_trainees_handler(event)
+        elif data == 'top_day':
+            await top_day_handler(event)
+        elif data == 'return_to_stats':
+            await return_to_stats_handler(event)
+        # Добавьте другие обработчики...
+
+    except Exception as e:
+        logging.error(f"Ошибка в callback_handler: {e}")
+
 # Удаление сообщения с кнопками после нажатия
 @bot.on(events.CallbackQuery)
 async def callback_handler(callback_event):
@@ -3832,11 +4355,24 @@ async def mark_user_handler(event):
         'rooster': 4
     }
 
-    role_type = event.pattern_match.group(1).decode('utf-8')
+    role_type = event.pattern_match.group(1)
     user_id = int(event.pattern_match.group(2))
-    reason = event.pattern_match.group(3).strip().decode('utf-8')
+    reason = event.pattern_match.group(3).strip()
 
     logging.info(f"Попытка изменить роль пользователя {user_id} на {role_type} с причиной: {reason}")
+
+    # ПРОВЕРКА: является ли целевой пользователь персоналом?
+    target_role = db.get_user_role(user_id)
+    if target_role in STAFF_ROLES:
+        target_role_name = ROLES.get(target_role, {}).get('name', 'Неизвестно')
+
+        await event.answer(
+            f"🚫 Нельзя заносить персонал базы!\n"
+            f"👤 Роль: {target_role_name}\n"
+            f"ℹ️ Персонал Infinity защищен от заноса.",
+            alert=True
+        )
+        return
 
     # ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА: Уже ли пользователь имеет роль скаммера
     current_role = db.get_user_role(user_id)
@@ -3872,7 +4408,8 @@ async def mark_user_handler(event):
         await event.answer("Ошибка при обновлении количества слитых скаммеров.", alert=True)
         return
 
-    logging.info(f"Количество слитых скаммеров для пользователя {event.sender_id} успешно обновлено на {scammers_slept}.")
+    logging.info(
+        f"Количество слитых скаммеров для пользователя {event.sender_id} успешно обновлено на {scammers_slept}.")
 
     chat_id = event.chat_id
     await event.client.send_message(
@@ -4628,7 +5165,27 @@ async def report_scammer(event):
     if not event.is_private:
         return  # Игнорируем, если не в ЛС
 
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "меню слива скаммера")
+
     keyboard = types.KeyboardButtonUrl(text="🚨 Отправить жалобу", url="https://t.me/Infinityantiscam")
+
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
+
     await event.respond(
         """🔥 Вы хотите слить скаммера? 🔥
 
@@ -4655,14 +5212,38 @@ async def list_garants(event):
     if not event.is_private:
         return
 
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message =  check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "список гарантов")
+
     # Получаем всех гарантов из базы
     try:
         garants = [row[0] for row in db.cursor.execute('SELECT user_id FROM users WHERE role_id = 1')]
     except Exception as e:
+        # Удаляем сообщение о загрузке если есть
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+                del button_loading_messages[user_id]
+            except:
+                pass
         return
 
     if not garants:
-        # ИЗМЕНЕНО: было await loading_message.edit(), теперь await event.respond()
+        # Удаляем сообщение о загрузке если есть
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+                del button_loading_messages[user_id]
+            except:
+                pass
         await event.respond("На данный момент Гарантов нету ⛔")
         return
 
@@ -4684,7 +5265,14 @@ async def list_garants(event):
             print(f"Ошибка при получении данных пользователя {uid}: {e}")
             continue
 
-    # УДАЛЕНО: await loading_message.delete()
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
+
     await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
 
 
@@ -4693,24 +5281,31 @@ async def list_volunteers(event):
     if not event.is_private:
         return
 
-    # УДАЛЕНО: Весь блок прогресс-загрузки
-    # loading_message = await event.respond("🔄 Загрузка\n▰▱▱▱▱▱▱▱▱▱ 10%")
-    # progress_steps = [
-    #     (20, "▰▰▱▱▱▱▱▱▱▱"),
-    #     (99, "▰▰▰▰▰▰▰▰▰▱")
-    # ]
-    # for percent, bar in progress_steps:
-    #     await asyncio.sleep(0.3)
-    #     await loading_message.edit(f"🔄 Загрузка\n{bar} {percent}%")
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message =  check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "список волонтёров")
 
     # Получаем всех волонтеров (роли 6-10)
     volunteers = []
-    for role_id in [6, 7, 8, 9, 10]:
+    for role_id in [6, 7, 8, 9, 10, 13]:  # Добавлена роль 13 (Айдош)
         volunteers.extend(
             [row[0] for row in db.cursor.execute('SELECT user_id FROM users WHERE role_id = ?', (role_id,))])
 
     if not volunteers:
-        # ИЗМЕНЕНО: было await loading_message.edit(), теперь await event.respond()
+        # Удаляем сообщение о загрузке если есть
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+                del button_loading_messages[user_id]
+            except:
+                pass
         await event.respond("На данный момент Волонтёров нету ⛔")
         return
 
@@ -4733,7 +5328,14 @@ async def list_volunteers(event):
         except:
             continue
 
-    # УДАЛЕНО: await loading_message.delete()
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
+
     await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
 
 
@@ -4742,21 +5344,28 @@ async def list_verified_users(event):
     if not event.is_private:
         return
 
-    # УДАЛЕНО: Весь блок прогресс-загрузки
-    # loading_message = await event.respond("🔄 Загрузка\n▰▱▱▱▱▱▱▱▱▱ 10%")
-    # progress_steps = [
-    #     (20, "▰▰▱▱▱▱▱▱▱▱"),
-    #     (99, "▰▰▰▰▰▰▰▰▰▱")
-    # ]
-    # for percent, bar in progress_steps:
-    #     await asyncio.sleep(0.3)
-    #     await loading_message.edit(f"🔄 Загрузка\n{bar} {percent}%")
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message =  check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "проверенных пользователей")
 
     # Получаем всех проверенных пользователей (роль 12)
     verified_users = [row[0] for row in db.cursor.execute('SELECT user_id FROM users WHERE role_id = 12')]
 
     if not verified_users:
-        # ИЗМЕНЕНО: было await loading_message.edit(), теперь await event.respond()
+        # Удаляем сообщение о загрузке если есть
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+                del button_loading_messages[user_id]
+            except:
+                pass
         await event.respond("На данный момент проверенных пользователей нет ⛔")
         return
 
@@ -4770,21 +5379,29 @@ async def list_verified_users(event):
         except:
             continue
 
-    # УДАЛЕНО: await loading_message.delete()
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
+
     await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
 
 
 @bot.on(events.NewMessage(pattern="🔓 Премиум"))
 async def premium_info(event):
-    # УДАЛЕНО: Весь блок прогресс-загрузки
-    # loading_message = await event.respond("🔄 Загрузка\n▰▱▱▱▱▱▱▱▱▱ 10%")
-    # progress_steps = [
-    #     (20, "▰▰▱▱▱▱▱▱▱▱"),
-    #     (99, "▰▰▰▰▰▰▰▰▰▱")
-    # ]
-    # for percent, bar in progress_steps:
-    #     await asyncio.sleep(0.2)
-    #     await loading_message.edit(f"🔄 Загрузка\n{bar} {percent}%")
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "информацию о премиуме")
 
     # Финальное сообщение
     final_image = "https://i.ibb.co/bMbQc9c0/photo-2025-06-01-12-01-48.jpg"
@@ -4801,7 +5418,14 @@ async def premium_info(event):
         [Button.inline("↩ Скрыть", b"hide_message")]
     ]
 
-    # УДАЛЕНО: await loading_message.delete()
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
+
     await event.respond(text, buttons=buttons, parse_mode='md', link_preview=True)
 
 
@@ -4811,13 +5435,16 @@ async def my_profile(event):
         await event.delete()
         return
 
-    # УДАЛЕНО: Весь блок прогресс-загрузки
-    # loading_message = await event.respond("🔄 Загрузка 10%\n▰")
-    # progress_steps = [20, 99]
-    # progress_bars = ["▰", "▰▰▰▰▰▰▰▰▰▰"]
-    # for i, (step, bar) in enumerate(zip(progress_steps, progress_bars)):
-    #     await asyncio.sleep(1)
-    #     await loading_message.edit(f"🔄 Загрузка {step}%\n{bar}")
+    user_id = event.sender_id
+
+    # Проверка защиты от спама
+    can_press, message = check_button_spam_protection(user_id)
+    if not can_press:
+        await event.respond(message)
+        return
+
+    # Показываем загрузку
+    await show_button_loading(event, "профиль")
 
     # Получаем user_id из события
     user_id = event.sender_id
@@ -4825,7 +5452,13 @@ async def my_profile(event):
     # Получаем данные пользователя из базы
     user_data = db.get_user(user_id)
     if user_data is None:
-        # ИЗМЕНЕНО: было await loading_message.edit(), теперь await event.respond()
+        # Удаляем сообщение о загрузке если есть
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+                del button_loading_messages[user_id]
+            except:
+                pass
         await event.respond("❌ Не удалось найти ваши данные в базе.")
         return
 
@@ -4864,7 +5497,14 @@ async def my_profile(event):
 🔍 **Проверок:** {checks_count}
 """
 
-    # УДАЛЕНО: await loading_message.delete()
+    # Удаляем сообщение о загрузке если есть
+    if user_id in button_loading_messages:
+        try:
+            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+            del button_loading_messages[user_id]
+        except:
+            pass
+
     await event.respond(
         profile_text,
         buttons=[
@@ -5690,6 +6330,7 @@ async def broadcast_status(event):
 
 def main():
     print("Bot started...")
+    bot.loop.create_task(cleanup_old_button_data())
     bot.run_until_disconnected()
 
 
