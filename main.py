@@ -27,6 +27,8 @@ from datetime import datetime, timedelta  # Правильный импорт
 from collections import defaultdict
 import functools
 import time
+import sys
+import signal
 
 user_scammers_count = {}
 user_states = {}
@@ -146,6 +148,14 @@ class Database:
         self.check_table_structure()
         self.check_and_fix_database()
 
+    def is_connected(self):
+        """Проверяет, открыто ли соединение с БД"""
+        try:
+            self.cursor.execute("SELECT 1")
+            return True
+        except sqlite3.Error:
+            return False
+
     def create_tables(self):
         logging.info("Проверка и создание таблиц если не существуют...")
 
@@ -167,7 +177,6 @@ class Database:
                    )''')
         logging.info("Таблица user_votes проверена/создана")
 
-        # УПРОЩЕННЫЙ ЗАПРОС БЕЗ КОММЕНТАРИЕВ
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
@@ -210,23 +219,22 @@ class Database:
             )''')
         logging.info("Таблица checks проверена/создана")
 
-        self.cursor.execute('DROP TABLE IF EXISTS scammers')
+        # ✅ ИСПРАВЛЕНО: Только создаем если не существует
+        self.cursor.execute('''CREATE TABLE IF NOT EXISTS scammers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                reason TEXT,
+                reported_by TEXT,
+                description TEXT,
+                reporter_id INTEGER,
+                unique_id VARCHAR(255),
+                proof_link TEXT,
+                added_date TEXT DEFAULT CURRENT_TIMESTAMP
+            )''')
+        logging.info("Таблица scammers проверена/создана")
 
-        self.cursor.execute('''CREATE TABLE scammers (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER,
-                    reason TEXT,
-                    reported_by TEXT,
-                    description TEXT,
-                    reporter_id INTEGER,
-                    scammer_id INTEGER,
-                    extra_info TEXT,
-                    unique_id VARCHAR(255),
-                    proof_link TEXT,
-                    added_date TEXT DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(scammer_id) REFERENCES users(user_id)
-                )''')
-        logging.info("Таблица scammers создана заново")
+        # Проверяем и добавляем недостающие поля
+        self.check_and_add_missing_columns('scammers')
 
         self.cursor.execute('''CREATE TABLE IF NOT EXISTS statistics (
                 total_messages INTEGER DEFAULT 0
@@ -264,8 +272,7 @@ class Database:
         logging.info("Таблица trust проверена/создана")
 
         self.conn.commit()
-
-        logging.info("Все таблицы проверены/создана")
+        logging.info("Все таблицы проверены/созданы")
 
 
     def check_table_structure(self):
@@ -329,6 +336,39 @@ class Database:
         except Exception as e:
             logging.error(f"Ошибка при проверке/исправлении базы данных: {e}")
 
+    def check_and_add_missing_columns(self, table_name):
+        """Проверяет и добавляет отсутствующие столбцы в таблицу"""
+        try:
+            # Требуемые поля для таблицы scammers
+            required_columns = {
+                'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+                'user_id': 'INTEGER',
+                'reason': 'TEXT',
+                'reported_by': 'TEXT',
+                'description': 'TEXT',
+                'reporter_id': 'INTEGER',
+                'unique_id': 'VARCHAR(255)',
+                'proof_link': 'TEXT',
+                'added_date': 'TEXT DEFAULT CURRENT_TIMESTAMP'
+            }
+
+            # Получаем текущие столбцы
+            self.cursor.execute(f"PRAGMA table_info({table_name})")
+            existing_columns = {row[1]: row[2] for row in self.cursor.fetchall()}
+
+            # Добавляем недостающие столбцы
+            for column, column_type in required_columns.items():
+                if column not in existing_columns:
+                    try:
+                        self.cursor.execute(f"ALTER TABLE {table_name} ADD COLUMN {column} {column_type}")
+                        logging.info(f"Добавлен столбец {column} в таблицу {table_name}")
+                    except Exception as e:
+                        logging.error(f"Ошибка добавления столбца {column}: {e}")
+
+            self.conn.commit()
+
+        except Exception as e:
+            logging.error(f"Ошибка проверки таблицы {table_name}: {e}")
 
     def get_user_rating(self, user_id):
         """Получает рейтинг пользователя с ограничением от 2.0 до 10.0"""
@@ -550,7 +590,7 @@ class Database:
                 return False
 
             # Получаем текущее значение
-            current = self.get_user_scammers_count(user_id)
+            current = self.get_user_reported_scammers_count(user_id)
             new_count = current + 1
 
             self.cursor.execute('UPDATE users SET scammers_count = ? WHERE user_id = ?', (new_count, user_id))
@@ -574,11 +614,20 @@ class Database:
             logging.error(f"Ошибка при добавлении пользователя: {e}")
 
     def get_user_role(self, user_id):
-        self.cursor.execute('SELECT role_id FROM users WHERE user_id = ?', (user_id,))
-        result = self.cursor.fetchone()
-        role = result[0] if result else 0
-        logging.info(f"Роль пользователя {user_id}: {role}")
-        return role
+        """Получает роль пользователя с проверкой соединения"""
+        if not self.is_connected():
+            self.reconnect()
+
+        try:
+            self.cursor.execute('SELECT role_id FROM users WHERE user_id = ?', (user_id,))
+            result = self.cursor.fetchone()
+            role = result[0] if result else 0
+            logging.info(f"Роль пользователя {user_id}: {role}")
+            return role
+        except Exception as e:
+            logging.error(f"Ошибка получения роли для {user_id}: {e}")
+            self.reconnect()
+            return 0
 
     def update_user(self, user_id, country=None, channel=None):
         logging.info(f"Обновление пользователя {user_id}: страна - {country}, канал - {channel}")
@@ -928,25 +977,71 @@ class Database:
             logging.error(f"Ошибка обновления роли для {user_id}: {e}")
             return False
 
-    def add_scammer(self, scammer_id, reason, reported_by, description, unique_id, proof_link=None):
-        # НЕ проверяем, существует ли уже скамер - разрешаем несколько заносов
-        # Проверка, существует ли пользователь в основной базе
-        self.cursor.execute("SELECT * FROM users WHERE user_id = ?", (scammer_id,))
-        user = self.cursor.fetchone()
+    def add_scammer(self, scammer_id, reason, reported_by, description, unique_id, proof_link=None, reporter_id=None):
+        try:
+            # Всегда проверяем структуру таблицы
+            self.cursor.execute("PRAGMA table_info(scammers)")
+            columns = [col[1] for col in self.cursor.fetchall()]
 
-        if user is None:
-            logging.error(f"Пользователь с ID {scammer_id} не найден. Не могу добавить скамера.")
+            logging.info(f"Добавление скамера: scammer_id={scammer_id}, reporter_id={reporter_id}")
+
+            if 'reporter_id' in columns:
+                # НОВАЯ версия с reporter_id
+                self.cursor.execute('''
+                    INSERT INTO scammers (user_id, reason, reported_by, description, scammer_id, unique_id, proof_link, reporter_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (scammer_id, reason, reported_by, description, scammer_id, unique_id, proof_link, reporter_id))
+                logging.info(f"Добавлено с reporter_id: {reporter_id}")
+            else:
+                # Старая версия
+                self.cursor.execute('''
+                    INSERT INTO scammers (user_id, reason, reported_by, description, scammer_id, unique_id, proof_link)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (scammer_id, reason, reported_by, description, scammer_id, unique_id, proof_link))
+                logging.info("Добавлено без reporter_id (старая структура)")
+
+            self.conn.commit()
+
+            # УВЕЛИЧИВАЕМ СЧЕТЧИК В ТАБЛИЦЕ users
+            if reporter_id:
+                # Получаем текущее значение
+                self.cursor.execute('SELECT scammers_count FROM users WHERE user_id = ?', (reporter_id,))
+                result = self.cursor.fetchone()
+
+                if result:
+                    current_count = result[0] if result[0] is not None else 0
+                    new_count = current_count + 1
+                else:
+                    new_count = 1
+                    # Если пользователя нет в таблице users, добавляем
+                    self.cursor.execute('INSERT INTO users (user_id, scammers_count) VALUES (?, ?)',
+                                        (reporter_id, new_count))
+
+                # Обновляем счетчик
+                self.cursor.execute('UPDATE users SET scammers_count = ? WHERE user_id = ?', (new_count, reporter_id))
+                self.conn.commit()
+
+                logging.info(f"✅ Счетчик scammers_count для {reporter_id} увеличен до {new_count}")
+            else:
+                logging.warning("⚠️ reporter_id не указан, счетчик не увеличен")
+
+            return True
+        except Exception as e:
+            logging.error(f"❌ Ошибка при добавлении скамера: {e}")
+            self.conn.rollback()
             return False
 
-        try:
-            # Добавляем скаммера (разрешаем несколько записей для одного user_id)
-            self.cursor.execute('''
-                INSERT INTO scammers (user_id, reason, reported_by, description, scammer_id, unique_id, proof_link)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (scammer_id, reason, reported_by, description, scammer_id, unique_id, proof_link))
-            self.conn.commit()
-            logging.info(
-                f"Запись о скамере {scammer_id} добавлена. Причина: {reason}. Уникальный ID: {unique_id}. Доказательства: {proof_link}")
+            # Увеличиваем счетчик в таблице users
+            if reporter_id:
+                self.cursor.execute('''
+                    UPDATE users 
+                    SET scammers_count = COALESCE(scammers_count, 0) + 1 
+                    WHERE user_id = ?
+                ''', (reporter_id,))
+                self.conn.commit()
+                logging.info(f"Счетчик scammers_count для {reporter_id} увеличен")
+
+            logging.info(f"Запись о скамере {scammer_id} добавлена. Занес: {reporter_id}")
             return True
         except Exception as e:
             logging.error(f"Ошибка при добавлении скамера: {e}")
@@ -982,27 +1077,40 @@ class Database:
         ''', (user_id, additional_reason))
         self.conn.commit()
 
-    def get_user_scammers_count(self, user_id):
-        """Получает общее количество занесенных скамеров для ЛЮБОЙ роли"""
+    def get_user_reported_scammers_count(self, user_id):
+        """Получает количество СЛИТЫХ скамеров (сколько занес в базу scammers)"""
         try:
-            # Сначала проверяем, есть ли столбец
-            self.cursor.execute("PRAGMA table_info(users)")
+            # Вариант 1: Ищем по reporter_id если есть такое поле
+            self.cursor.execute("PRAGMA table_info(scammers)")
             columns = [col[1] for col in self.cursor.fetchall()]
 
-            if 'scammers_count' not in columns:
-                logging.warning(f"Столбец scammers_count не найден в таблице users")
-                return 0
+            if 'reporter_id' in columns:
+                self.cursor.execute('SELECT COUNT(*) FROM scammers WHERE reporter_id = ?', (user_id,))
+                result = self.cursor.fetchone()
+                count = result[0] if result else 0
 
-            self.cursor.execute('SELECT scammers_count FROM users WHERE user_id = ?', (user_id,))
-            result = self.cursor.fetchone()
-            if result:
-                count = result[0] if result[0] is not None else 0
-                logging.info(f"Общий счетчик скамеров для {user_id}: {count}")
+                if count > 0:
+                    logging.info(f"Найдено {count} слитых скамеров для {user_id} (по reporter_id)")
+                    return count
+
+            # Вариант 2: Ищем по имени в reported_by
+            # Получаем имя пользователя из базы
+            self.cursor.execute('SELECT username, first_name FROM users WHERE user_id = ?', (user_id,))
+            user_info = self.cursor.fetchone()
+
+            if user_info:
+                username = user_info[0] or user_info[1] or str(user_id)
+                # Ищем упоминания имени в reported_by
+                self.cursor.execute('SELECT COUNT(*) FROM scammers WHERE reported_by LIKE ?', (f'%{username}%',))
+                result = self.cursor.fetchone()
+                count = result[0] if result else 0
+
+                logging.info(f"Найдено {count} слитых скамеров для {user_id} (по имени в reported_by)")
                 return count
-            logging.info(f"Пользователь {user_id} не найден, возвращаем 0")
+
             return 0
         except Exception as e:
-            logging.error(f"Ошибка получения общего счетчика скамеров для {user_id}: {e}")
+            logging.error(f"Ошибка получения количества слитых скамеров для {user_id}: {e}")
             return 0
 
     def update_user_scammers_count(self, user_id, new_count):
@@ -1045,6 +1153,68 @@ class Database:
             return count
         except Exception as e:
             logging.error(f"Ошибка базы данных в get_check_count: {e}")
+            return 0
+
+    def get_display_scammers_count(self, user_id):
+        """Получает количество для отображения в чеке"""
+        try:
+            # 1. Получаем из поля scammers_count таблицы users
+            self.cursor.execute('SELECT scammers_count FROM users WHERE user_id = ?', (user_id,))
+            result = self.cursor.fetchone()
+
+            if result:
+                count_from_users = result[0] if result[0] is not None else 0
+            else:
+                count_from_users = 0
+                # Если пользователя нет, добавляем запись
+                self.cursor.execute('INSERT OR IGNORE INTO users (user_id, scammers_count) VALUES (?, 0)', (user_id,))
+                self.conn.commit()
+
+            logging.info(f"📊 Из поля scammers_count для {user_id}: {count_from_users}")
+
+            # 2. Проверяем таблицу scammers
+            real_count = 0
+
+            # Проверяем есть ли поле reporter_id
+            self.cursor.execute("PRAGMA table_info(scammers)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+
+            if 'reporter_id' in columns:
+                # Ищем по reporter_id
+                self.cursor.execute('SELECT COUNT(*) FROM scammers WHERE reporter_id = ?', (user_id,))
+                real_result = self.cursor.fetchone()
+                real_count = real_result[0] if real_result else 0
+
+                if real_count > 0:
+                    logging.info(f"🔍 Найдено {real_count} записей в scammers для {user_id} по reporter_id")
+
+            # 3. Если не нашли по reporter_id, ищем в reported_by
+            if real_count == 0:
+                try:
+                    # Получаем username для поиска
+                    self.cursor.execute('SELECT username FROM users WHERE user_id = ?', (user_id,))
+                    user_result = self.cursor.fetchone()
+
+                    if user_result and user_result[0]:
+                        username = user_result[0]
+                        self.cursor.execute('SELECT COUNT(*) FROM scammers WHERE reported_by LIKE ?',
+                                            (f'%{username}%',))
+                        real_result = self.cursor.fetchone()
+                        real_count = real_result[0] if real_result else 0
+
+                        if real_count > 0:
+                            logging.info(f"🔍 Найдено {real_count} записей в scammers для {user_id} по username")
+                except Exception as e:
+                    logging.error(f"Ошибка поиска по username: {e}")
+
+            # 4. Возвращаем большее значение
+            final_count = max(count_from_users, real_count)
+            logging.info(
+                f"🎯 Финальное значение для {user_id}: users={count_from_users}, scammers={real_count}, итого={final_count}")
+            return final_count
+
+        except Exception as e:
+            logging.error(f"❌ Ошибка в get_display_scammers_count для {user_id}: {e}")
             return 0
 
     def get_user_scammers_slept(self, user_id):
@@ -1436,58 +1606,184 @@ async def statistics(event):
     # Показываем загрузку
     await show_button_loading(event, "статистику")
 
-    # Получаем статистические данные
-    user = await event.get_sender()
-    # Используем существующий глобальный экземпляр db вместо создания нового
+    try:
+        # Получаем общую статистику
+        total_scammers = db.cursor.execute('SELECT COUNT(*) FROM scammers').fetchone()[0] or 0
+        total_users = db.cursor.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        total_checks = db.cursor.execute('SELECT SUM(check_count) FROM users').fetchone()[0] or 0
 
-    # Основные статистические данные
-    total_checks = db.cursor.execute('SELECT SUM(check_count) FROM users').fetchone()[0] or 0
-    scammers_count = db.cursor.execute('SELECT COUNT(*) FROM scammers').fetchone()[0]
-    total_users = db.cursor.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        # Получаем топ персонала по количеству слитых скамеров
+        top_staff = db.cursor.execute('''
+            SELECT u.user_id, u.username, u.role_id, u.scammers_count 
+            FROM users u 
+            WHERE u.role_id IN (6, 7, 8, 9, 10, 11, 13) 
+            AND u.scammers_count > 0
+            ORDER BY u.scammers_count DESC 
+            LIMIT 10
+        ''').fetchall()
 
-    # Статистика по ролям
-    roles_stats = {
-        'admins': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 7').fetchone()[0],
-        'guarantors': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 1').fetchone()[0],
-        'verified': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 12').fetchone()[0],
-        'trainees': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 6').fetchone()[0]
+        # Формируем текст статистики
+        text = f"""📊 **СТАТИСТИКА БАЗЫ INFINITY**
+━━━━━━━━━━━━━━━━━━━━
+[⠀](https://i.ibb.co/Fzpqd0K/IMG-3735.jpg)
+
+🚫 **Скаммеров в базе:** `{total_scammers}`
+👥 **Пользователей бота:** `{total_users}`
+🔍 **Всего проверок:** `{total_checks}`
+
+🏆 **ТОП ПЕРСОНАЛА ПО СЛИТЫМ СКАМЕРАМ:**
+"""
+
+        # Создаем кнопки для топ персонала
+        buttons = []
+
+        for i, (user_id_staff, username, role_id, scammers_count) in enumerate(top_staff, 1):
+            # Получаем имя роли
+            role_name = ROLES.get(role_id, {}).get('name', 'Неизвестно')
+            role_emoji = get_role_emoji(role_id)
+
+            # Формируем отображаемое имя
+            if username:
+                display_name = f"{username}"
+            else:
+                display_name = f"ID:{user_id_staff}"
+
+            # Сокращаем слишком длинные имена
+            if len(display_name) > 15:
+                display_name = display_name[:12] + "..."
+
+            # Добавляем кнопку
+            button_text = f"{role_emoji} {display_name} - {scammers_count}🔪"
+            buttons.append([Button.inline(button_text, f"staff_stats_{user_id_staff}")])
+
+        # Если нет топ персонала
+        if not top_staff:
+            text += "\n📭 Пока нет активного персонала"
+
+        # Добавляем разделитель
+        text += "\n━━━━━━━━━━━━━━━━━━━━\n"
+
+        # Кнопки навигации
+        nav_buttons = [
+            [Button.inline("🏆 Топ Стажеров", b"top_trainees")],
+            [Button.inline("😎 Топ Активных", b"top_day")],
+            [Button.inline("🔄 Обновить", b"refresh_stats")]
+        ]
+
+        buttons.extend(nav_buttons)
+
+        # Добавляем кнопку чата
+        buttons.append([Button.url("🎇 Наша База", 'https://t.me/Infinityantiscam')])
+
+        # Удаляем сообщение о загрузке если есть
+        if user_id in button_loading_messages:
+            try:
+                await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
+                del button_loading_messages[user_id]
+            except:
+                pass
+
+        stat_message = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
+        bot.stat_message_id = stat_message.id
+
+    except Exception as e:
+        logging.error(f"Ошибка в статистике: {e}")
+        await event.respond(f"⚠️ Ошибка загрузки статистики: {str(e)}")
+
+
+# Вспомогательная функция для эмодзи ролей
+def get_role_emoji(role_id):
+    emoji_map = {
+        6: "👨‍🎓",  # Стажер
+        7: "👮",  # Админ
+        8: "🎩",  # Директор
+        9: "👑",  # Президент
+        10: "⭐",  # Владелец
+        11: "💻",  # Кодер
+        13: "🌟"  # Айдош
     }
+    return emoji_map.get(role_id, "👤")
 
-    text = f"""🔍 {user.first_name}, вот текущая статистика бота:
-    [⠀](https://i.ibb.co/dwfVKmMH/photo-2025-04-17-17-44-19-2.jpg)
 
-    🚫 Скаммеров в базе: {scammers_count}
-    👥 Пользователей бота: {total_users}
+@bot.on(events.NewMessage(pattern=r'(?i)^/fullstats|/полнаястата'))
+async def full_statistics(event):
+    """Полная статистика по всем ролям"""
+    if not event.is_private:
+        return
 
-    ⚖️ Админов: {roles_stats['admins']}
-    💎 Гарантов: {roles_stats['guarantors']}
-    ✅ Проверенных: {roles_stats['verified']}
-    👨‍🎓 Стажеров: {roles_stats['trainees']}
+    user_id = event.sender_id
 
-    🔎 Всего проверок: {total_checks}
-    ⏳ Последняя проверка: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-    """
+    try:
+        # Получаем статистику по каждой роли
+        stats_by_role = {}
 
-    # Создаем кнопки
-    buttons = [
-        [Button.inline("🏆 Топ Стажеров", b"top_trainees")],
-        [Button.inline("😎 Топ Активных", b"top_day")],
-        [Button.url("🎇 Наша База", 'https://t.me/Infinityantiscam')]
-    ]
+        for role_id in [6, 7, 8, 9, 10, 11, 13]:  # Все роли персонала
+            role_name = ROLES.get(role_id, {}).get('name', 'Неизвестно')
 
-    # Удаляем сообщение о загрузке если есть
-    if user_id in button_loading_messages:
-        try:
-            await bot.delete_messages(event.chat_id, button_loading_messages[user_id])
-            del button_loading_messages[user_id]
-        except:
-            pass
+            # Количество пользователей с этой ролью
+            db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = ?', (role_id,))
+            count_users = db.cursor.fetchone()[0] or 0
 
-    stat_message = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
+            # Общее количество слитых скамеров для этой роли
+            db.cursor.execute('SELECT SUM(scammers_count) FROM users WHERE role_id = ?', (role_id,))
+            total_scammers = db.cursor.fetchone()[0] or 0
 
-    # Сохраняем ID сообщения для последующего удаления
-    bot.stat_message_id = stat_message.id
+            # Топ 3 пользователя этой роли
+            db.cursor.execute('''
+                SELECT user_id, username, scammers_count 
+                FROM users 
+                WHERE role_id = ? AND scammers_count > 0
+                ORDER BY scammers_count DESC 
+                LIMIT 3
+            ''', (role_id,))
+            top_users = db.cursor.fetchall()
 
+            stats_by_role[role_id] = {
+                'name': role_name,
+                'count_users': count_users,
+                'total_scammers': total_scammers,
+                'top_users': top_users
+            }
+
+        # Формируем сообщение
+        text = "🏆 **ПОЛНАЯ СТАТИСТИКА ПЕРСОНАЛА**\n━━━━━━━━━━━━━━━━━━━━\n[⠀](https://i.ibb.co/Fzpqd0K/IMG-3735.jpg)\n"
+
+        # Создаем кнопки по ролям
+        role_buttons = []
+
+        for role_id in [6, 7, 8, 9, 10, 11, 13]:
+            stats = stats_by_role[role_id]
+            emoji = get_role_emoji(role_id)
+            button_text = f"{emoji} {stats['name']} - {stats['total_scammers']}🔪"
+            role_buttons.append([Button.inline(button_text, f"role_stats_{role_id}")])
+
+        # Кнопки навигации
+        nav_buttons = [
+            [Button.inline("📊 Общая статистика", b"general_stats")],
+            [Button.inline("👥 Все пользователи", b"all_users_stats")],
+            [Button.inline("🔄 Обновить", b"refresh_fullstats")]
+        ]
+
+        all_buttons = role_buttons + nav_buttons
+
+        await event.respond(text, parse_mode='md', link_preview=True, buttons=all_buttons)
+
+    except Exception as e:
+        logging.error(f"Ошибка в полной статистике: {e}")
+        await event.respond(f"⚠️ Ошибка: {str(e)}")
+
+def get_role_emoji(role_id):
+    """Возвращает эмодзи для роли"""
+    emoji_map = {
+        6: "👨‍🎓",  # Стажер
+        7: "👮",   # Админ
+        8: "🎩",   # Директор
+        9: "👑",   # Президент
+        10: "⭐",  # Владелец
+        11: "💻",  # Кодер
+        13: "🌟"   # Айдош
+    }
+    return emoji_map.get(role_id, "👤")
 
 @bot.on(events.NewMessage(pattern='/check_my_photo'))
 async def check_my_photo(event):
@@ -1792,9 +2088,12 @@ async def get_user_profile_response(event, user, user_data):
     checks_count = db.get_check_count(user_id)
     logging.info(f"Количество проверок для user_id {user_id} после увеличения: {checks_count}")
 
-    # Получаем общий счетчик скамеров
-    scammers_count = db.get_user_scammers_count(user_id)
-    scammers_slept = db.get_user_scammers_slept(user_id)
+    # ✅ ИСПРАВЛЕНО: Получаем ПРАВИЛЬНОЕ количество для отображения
+    # Используем новый метод get_display_scammers_count
+    scammers_display_count = db.get_display_scammers_count(user_id)
+
+    # Для обратной совместимости
+    scammers_slept = scammers_display_count
 
     logging.info(f"Custom image URL retrieved for user {user_id}: {custom_image_url}")
 
@@ -1817,7 +2116,6 @@ async def get_user_profile_response(event, user, user_data):
         user_name = f"@{user.username}"
     else:
         user_name = f"ID: {user.id}"
-
 
     if hasattr(user, 'username') and user.username:
         profile_url = f"https://t.me/{user.username}"
@@ -1857,7 +2155,6 @@ async def get_user_profile_response(event, user, user_data):
                 scammer_details += f"   👮 **Занес:** {reported_by}\n"
                 scammer_details += f"   📅 **Дата:** {formatted_date}\n\n"
 
-
     profile_url = f"tg://user?id={user.id}"
     buttons = [
         [
@@ -1869,7 +2166,6 @@ async def get_user_profile_response(event, user, user_data):
             Button.inline("⭐ Оценить", f"rate_user_{user_id}".encode())
         ]
     ]
-
 
     if role_id in [2, 3, 4, 5]:  # Возможно скамер, Скамер, Петух, Подозрение на скам
         buttons.append([Button.inline("🚫 Вынести из базы", f"remove_from_db_{user_id}".encode())])
@@ -1901,9 +2197,7 @@ async def get_user_profile_response(event, user, user_data):
     else:
         logging.warning("granted_by_id равен None, гарант не найден.")
 
-
     theme_url = ROLES.get(role_id, {}).get('preview_url', '')
-
 
     if not theme_url:
         theme_url = "https://i.ibb.co/ycyPRXrb/photo-2025-04-17-17-44-20-2.jpg"  # Стандартная картинка
@@ -1911,15 +2205,16 @@ async def get_user_profile_response(event, user, user_data):
     theme_preview = f"{theme_url}\n\n"
 
     # ============ ФОРМИРОВАНИЕ ТЕКСТА ПО РОЛЯМ ============
+    # ✅ ИСПРАВЛЕНО: Везде используется scammers_display_count вместо scammers_slept
 
     if role_id == 0:
-        preview_url =ROLES[role_id]['preview_url']
+        preview_url = ROLES[role_id]['preview_url']
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[❌] Статус: не найден в базе. Риск скама: **44%**\n"
             f"[ℹ️] [Узнайте о гарантах](https://telegra.ph/Kto-takoj-GARANT-05-29)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[🔒] Используйте Гарантов infinity для безопасных сделок.\n\n"
             f"[📅] Дата: {current_time} | 🔎Проверок: {checks_count}\n"
         )
@@ -1929,9 +2224,9 @@ async def get_user_profile_response(event, user, user_data):
         message_text = (
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[❌] Статус: Проверен(а) гарантом | [ {granted_by_username} ](tg://user?id={granted_by_id}) ✅\n"
-            f"[ℹ️] [Узнайте о гарантах](https://telegra.ph/Kto-takoj-GARANT-05-29)\n\n"
+            f"[ℹ️] [Узнайте о гарантам](https://telegra.ph/Kto-takoj-GARANT-05-29)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[🔒] Используйте Гарантов infinity для безопасных сделок.\n\n"
             f"[📅] Дата: {current_time} | 🔎Проверок: {checks_count}\n"
         )
@@ -1943,7 +2238,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[✅] Статус: Гарант\n"
             f"[ℹ️] [Узнайте о гарантах](https://telegra.ph/Kto-takoj-GARANT-05-29)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[🔒] Данный пользователь является проверенным гарантом infinity\n\n"
             f"[📅] Дата: {current_time} | 🔎Проверок: {checks_count}\n"
         )
@@ -1955,7 +2250,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[💢] Статус: Владелец\n"
             f"[💖] [Персонал infinity](https://t.me/infinityantiscam)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[🔒] Данный пользователь является Cоздателем базы infinity\n\n"
             f"[📅] Дата: {current_time} | 🔎Проверок: {checks_count}\n"
         )
@@ -1967,7 +2262,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[🧿] Статус: Президент\n"
             f"[💖] [Персонал infinity](https://t.me/infinityantiscam)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[⚠] Выговоры: {warnings_count} "
             f"[🔒] Данный пользователь является надёжным президентом базы infinity\n\n"
             f"[📅] Дата: {current_time} | 🔎Проверок: {checks_count}\n"
@@ -1979,7 +2274,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🐓] Статус: Петух\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"📚 Описание: {description}\n"
             f"{scammer_details}"
             f"[❌] Данный пользователь является подозрительной личностью! \n\n"
@@ -1992,7 +2287,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🛑] Статус: Скаммер\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"📚 Описание: {description}\n"
             f"{scammer_details}"
             f"[❌] Данный пользователь Является скаммером! Не идите первыми!\n\n"
@@ -2006,7 +2301,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[🔍] Статус: Админ\n"
             f"[💖] [Персонал infinity](https://t.me/infinityantiscam)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[⚠] Выговоры: {warnings_count} "
             f"[🔒] Данный пользователь является Администратором Базы infinity\n\n"
             f"[📅] Дата: {current_time} | 🔎Проверок: {checks_count}\n"
@@ -2018,7 +2313,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🛑] Статус: Подозрения На Скам\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"📚 Описание: {description}\n"
             f"{scammer_details}"
             f"[❌] Данный пользователь Является подозрительной личностью, будьте осторожны!\n\n"
@@ -2031,7 +2326,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[👤][ {user_name} ](tg://user?id={user_id}) #id{user_id} [⠀]({ROLES[role_id]['preview_url']})\n\n"
             f"[🛑] Статус: Возможно скаммер\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"📚 Описание: {description}\n"
             f"{scammer_details}"
             f"[❌] Данный пользователь Является Потонциальным скаммером, будьте осторожны!\n\n"
@@ -2045,7 +2340,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[👨‍🎓] Статус: Стажер\n"
             f"[💖] [Персонал infinity](https://t.me/infinityantiscam)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[⚠] Выговоры: {warnings_count}\n"
             f"[📣] Канал: {channel}\n\n"
             f"[🔒] Данный пользователь является Стажёром Базы infinity\n\n"
@@ -2059,7 +2354,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[‍🎩] Статус: Директор\n"
             f"[💖] [Персонал infinity](https://t.me/infinityantiscam)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[⚠] Выговоры: {warnings_count}\n"
             f"[📣] Канал: {channel}\n\n"
             f"[🔒] Данный пользователь является Директором Базы infinity\n\n"
@@ -2073,7 +2368,7 @@ async def get_user_profile_response(event, user, user_data):
             f"[👨‍💻] Статус: Кодер\n"
             f"[💖] [Персонал infinity](https://t.me/infinityantiscam)\n\n"
             f"[📍] Регион: {country_display}\n"
-            f"[🚫] Разоблачено скаммеров: {scammers_slept}\n\n"
+            f"[🚫] Разоблачено скаммеров: {scammers_display_count}\n\n"  # ✅ ИСПРАВЛЕНО
             f"[⚠] Выговоры: {warnings_count}\n"
             f"[📣] Канал: {channel}\n\n"
             f"[🔒] Данный пользователь является Техническим Специалистом Базы infinity\n\n"
@@ -2658,7 +2953,7 @@ async def profile_command(event):
 
     # Для персонала показываем количество слитых скамеров
     if role in [6, 7, 8, 9, 10]:  # Проверяем, если это персонал
-        scammers_count = db.get_user_scammers_count(user_id)  # Получаем количество слитых скаммеров
+        scammers_count = db.get_user_reported_scammers_count(user_id)  # Получаем количество слитых скаммеров
         scammers_info = f"🔥 **Скаммеров слито:** `{scammers_count}`\n"
     else:
         scammers_info = "🔥 **Скаммеров слито:** `0`\n"  # Если не персонал, показываем 0
@@ -2684,39 +2979,73 @@ async def thank_command(event):
 
     # Проверка роли пользователя, который вызывает команду
     user_role = db.get_user_role(user_id)
-    allowed_roles = [6, 8, 10, 11, 9, 13]
+    allowed_roles = [6, 7, 8, 9, 10, 11, 13]  # Стажер, Админ, Директор, Президент, Создатель, Кодер, Заместитель
 
     if user_role not in allowed_roles:
+        await event.respond("❌ Только персонал базы может выдавать +спасибо!")
         return
 
     if event.reply_to_msg_id:
         reply_message = await event.get_reply_message()
         target_user_id = reply_message.sender_id
 
-        # Увеличиваем ОБЩИЙ счетчик скамеров
-        db.increment_scammers_count(target_user_id)
+        # Получаем текущее РЕАЛЬНОЕ количество слитых скамеров
+        current_real_count = db.get_user_reported_scammers_count(target_user_id)
 
-        # Также увеличиваем счетчик для персонала (scammers_slept)
-        target_role = db.get_user_role(target_user_id)
-        if target_role in [6, 7, 8, 9, 10, 11, 13]:
-            db.increment_scammers_count_all_roles(target_user_id)  # старый метод
+        # Увеличиваем счетчик в таблице users (scammers_count)
+        try:
+            # Получаем текущее значение
+            db.cursor.execute('SELECT scammers_count FROM users WHERE user_id = ?', (target_user_id,))
+            result = db.cursor.fetchone()
 
-        # Получаем обновленный счетчик
-        new_count = db.get_user_scammers_count(target_user_id)
+            if result:
+                current_count = result[0] if result[0] is not None else 0
+                new_count = current_count + 1
+            else:
+                new_count = 1
+
+            # Обновляем значение
+            db.cursor.execute('UPDATE users SET scammers_count = ? WHERE user_id = ?', (new_count, target_user_id))
+            db.conn.commit()
+
+            logging.info(f"Счетчик scammers_count для {target_user_id} увеличен: {new_count}")
+        except Exception as e:
+            logging.error(f"Ошибка обновления scammers_count: {e}")
+            new_count = current_real_count + 1
 
         try:
             sender = await event.get_sender()
             target_user = await bot.get_entity(target_user_id)
 
-            await event.respond(
-                f"📛 Пользователю [{target_user.first_name}](tg://user?id={target_user_id}) выдано +спасибо.\n\n"
-                f"👤 Выдал: [{sender.first_name}](tg://user?id={user_id})\n"
-                f"🔥 **Общий счетчик скамеров:** {new_count}\n\n"
-                f"📈 Спасибо, что боретесь со скамом вместе с Infinity!",
-                parse_mode='md'
+            # Формируем сообщение с ПРАВИЛЬНЫМИ данными
+            response_text = (
+                f"📛 **Пользователю выдано +спасибо!**\n\n"
+                f"👤 **Получил:** [{target_user.first_name}](tg://user?id={target_user_id})\n"
+                f"👮 **Выдал:** [{sender.first_name}](tg://user?id={user_id})\n"
+                f"🔥 **Общий счетчик:** {new_count}\n"
+                f"🎯 **Реально слито скамеров:** {current_real_count}\n\n"
+                f"📈 Спасибо, что боретесь со скамом вместе с Infinity!"
             )
-        except:
-            await event.respond(f"✅ +спасибо выдано пользователю с ID: {target_user_id}\n🔥 Общий счетчик: {new_count}")
+
+            await event.respond(response_text, parse_mode='md')
+
+            # Уведомляем получателя
+            try:
+                await bot.send_message(
+                    target_user_id,
+                    f"🎉 **Вам выдано +спасибо!**\n\n"
+                    f"👮 **Выдал:** {sender.first_name}\n"
+                    f"🔥 **Ваш счетчик:** {new_count}\n"
+                    f"🎯 **Реально слито скамеров:** {current_real_count}\n\n"
+                    f"Спасибо за ваш вклад в борьбу со скамом!",
+                    buttons=Button.inline("↩Скрыть", b"hide_message")
+                )
+            except:
+                pass  # Пользователь мог заблокировать бота
+
+        except Exception as e:
+            logging.error(f"Ошибка получения данных пользователя: {e}")
+            await event.respond(f"✅ +спасибо выдано пользователю с ID: {target_user_id}\n🔥 Новый счетчик: {new_count}")
     else:
         await event.respond("❌ Ответьте на сообщение пользователя, которому хотите выдать +спасибо.")
 
@@ -3319,7 +3648,7 @@ async def handle_role_command(event):
             return
 
         # Обычная выдача ролей
-        if current_role in [0, 1]:
+        if current_role in [1]:
             db.add_user(user.id, user.username)
             db.update_role(user.id, role_mapping[role])
             msg = await event.reply(
@@ -3782,12 +4111,13 @@ async def accept_scam_handler(event):
             scam_data['user_name'],
             scam_data['reason'],
             unique_id,
-            scam_data['proof_link']
+            scam_data['proof_link'],
+            scam_data['user_id']
         )
 
         if scammer_added:
             # Увеличиваем счётчик слитых скаммеров у стажёра
-            current_count = db.get_user_scammers_count(scam_data['user_id'])
+            current_count = db.get_user_reported_scammers_count(scam_data['user_id'])
             new_count = current_count + 1
             db.update_user_scammers_count(scam_data['user_id'], new_count)
 
@@ -4242,13 +4572,14 @@ async def process_direct_role_selection(event, unique_id, role_id, role_name):
             scam_data['user_name'],
             scam_data['reason'],
             unique_id,
-            scam_data['proof_link']
+            scam_data['proof_link'],
+            scam_data['user_id']
         )
 
         if scammer_added:
             # Увеличиваем счётчик слитых скамеров у пользователя
             if scam_data['user_role'] in STAFF_ROLES:
-                current_count = db.get_user_scammers_count(scam_data['user_id'])
+                current_count = db.get_user_reported_scammers_count(scam_data['user_id'])
                 new_count = current_count + 1
                 db.update_user_scammers_count(scam_data['user_id'], new_count)
 
@@ -4397,7 +4728,7 @@ async def mark_user_handler(event):
     db.update_role(user_id, role_mapping[role_type])
 
     # Увеличиваем количество слитых скаммеров для пользователя, который инициировал команду
-    current_count = db.get_user_scammers_count(event.sender_id)
+    current_count = db.get_user_reported_scammers_count(event.sender_id)
     logging.info(f"Текущее количество слитых скаммеров для пользователя {event.sender_id}: {current_count}")
 
     scammers_slept = current_count + 1
@@ -5013,95 +5344,501 @@ async def list_online_garants(event):
     await event.respond(text, buttons=buttons, parse_mode='markdown', link_preview=True)
     logging.info("Список онлайн гарантов успешно отправлен.")
 
-@bot.on(events.CallbackQuery(data=b"top_trainees"))
-async def top_trainees_handler(event):
+
+@bot.on(events.CallbackQuery(data=b"top_admins"))
+async def top_admins_handler(event):
+    """Топ админов по слитым скамерам"""
     try:
-        await bot.delete_messages(event.chat_id, bot.stat_message_id)
-    except Exception as e:
-        print(f"Ошибка при удалении сообщения: {e}")
+        await bot.delete_messages(event.chat_id, event.message_id)
+    except:
+        pass
+
+    # Получаем топ админов
+    top_admins = db.cursor.execute('''
+        SELECT u.user_id, u.username, u.scammers_count, u.role_id,
+               (SELECT COUNT(*) FROM scammers WHERE reporter_id = u.user_id) as real_scammers
+        FROM users u 
+        WHERE u.role_id IN (7, 8, 9, 10, 11, 13) 
+        AND COALESCE(scammers_count, 0) > 0
+        ORDER BY COALESCE(scammers_count, 0) DESC 
+        LIMIT 10
+    ''').fetchall()
+
+    if not top_admins:
+        text = """👮 **ТОП АДМИНИСТРАЦИИ**
+━━━━━━━━━━━━━━━━━━━━
+[⠀](https://i.ibb.co/SKysgbvC/photo-2025-04-17-17-44-20-3.jpg)
+
+📭 **Администраторы пока не занесли скамеров**
+
+👮 Администрация базы Infinity
+🔪 Заносите скамеров и подавайте пример!
+🎯 Ваши заносы вдохновляют стажёров
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+        buttons = [
+            [Button.inline("🔄 Обновить", b"top_admins")],
+            [Button.inline("🏆 Топ Стажёров", b"top_trainees")],
+            [Button.inline("📊 Назад к статистике", b"return_to_stats")]
+        ]
+
+        msg = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
+        return
+
+    text = f"""👮 **ТОП-{len(top_admins)} АДМИНИСТРАЦИИ**
+━━━━━━━━━━━━━━━━━━━━
+[⠀](https://i.ibb.co/SKysgbvC/photo-2025-04-17-17-44-20-3.jpg)
+
+🏆 **Топ администраторов по заносам:**
+━━━━━━━━━━━━━━━━━━━━
+"""
+
+    buttons = []
+
+    for i, (user_id, username, scammers_count, role_id, real_scammers) in enumerate(top_admins, 1):
+        # Медальки
+        if i == 1:
+            medal = "👑"
+        elif i == 2:
+            medal = "🥈"
+        elif i == 3:
+            medal = "🥉"
+        else:
+            medal = f"{i}."
+
+        # Имя для отображения
+        if username:
+            display_name = f"@{username}" if not username.startswith('@') else username
+        else:
+            display_name = f"ID:{user_id}"
+
+        if len(display_name) > 18:
+            display_name = display_name[:15] + "..."
+
+        # Роль
+        role_name = ROLES.get(role_id, {}).get('name', 'Админ')
+        role_emoji = get_role_emoji(role_id)
+
+        # Количество
+        final_count = max(scammers_count or 0, real_scammers or 0)
+
+        text += f"{medal} **{display_name}** ({role_emoji}{role_name}) - `{final_count}`🔪\n"
+
+        # Кнопка
+        if i <= 5:
+            button_text = f"{role_emoji} {display_name} - {final_count}🔪"
+            if len(button_text) > 20:
+                display_short = display_name[:8] + ".." if len(display_name) > 8 else display_name
+                button_text = f"{role_emoji} {display_short} - {final_count}🔪"
+
+            buttons.append([Button.inline(button_text, f"admin_stats_{user_id}")])
+
+    # Статистика
+    total_scammers = sum(max(row[2] or 0, row[4] or 0) for row in top_admins)
+    avg_scammers = total_scammers / len(top_admins) if top_admins else 0
+
+    text += f"""
+━━━━━━━━━━━━━━━━━━━━
+📊 **СТАТИСТИКА:**
+• Всего заносов админов: `{total_scammers}`
+• В среднем на админа: `{avg_scammers:.1f}`
+• Админов в топе: `{len(top_admins)}`
+
+👮 **Администрация ведёт за собой!**
+• Подавайте пример стажёрам
+• Активно работайте со скамерами
+• Поддерживайте порядок в базе
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+
+    # Кнопки
+    nav_buttons = [
+        [Button.inline("🔄 Обновить", b"top_admins")],
+        [Button.inline("🏆 Топ Стажёров", b"top_trainees")],
+        [Button.inline("📊 Общая статистика", b"return_to_stats")]
+    ]
+
+    if buttons:
+        paired_buttons = []
+        for i in range(0, len(buttons), 2):
+            if i + 1 < len(buttons):
+                paired_buttons.append([buttons[i][0], buttons[i + 1][0]])
+            else:
+                paired_buttons.append([buttons[i][0]])
+
+        for nav_row in nav_buttons:
+            paired_buttons.append(nav_row)
+
+        buttons = paired_buttons
+    else:
+        buttons = nav_buttons
+
+    msg = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(pattern=rb'trainee_stats_(\d+)'))
+async def trainee_stats_handler(event):
+    """Статистика конкретного стажера"""
+    trainee_id = int(event.pattern_match.group(1))
 
     try:
+        # Получаем данные стажера
+        db.cursor.execute('''
+            SELECT u.user_id, u.username, u.scammers_count, u.check_count, 
+                   u.warnings, u.curator_id,
+                   (SELECT COUNT(*) FROM scammers WHERE reporter_id = u.user_id) as real_scammers,
+                   (SELECT COUNT(*) FROM scammers WHERE reported_by LIKE '%' || u.username || '%') as by_name
+            FROM users u 
+            WHERE u.user_id = ? AND u.role_id = 6
+        ''', (trainee_id,))
+
+        trainee_data = db.cursor.fetchone()
+
+        if not trainee_data:
+            await event.answer("❌ Стажёр не найден", alert=True)
+            return
+
+        (user_id, username, scammers_count, check_count,
+         warnings, curator_id, real_scammers, by_name) = trainee_data
+
+        # Имя для отображения
+        display_name = username or f"ID:{user_id}"
+
+        # Куратор
+        curator_name = "Не назначен"
+        if curator_id:
+            db.cursor.execute('SELECT username FROM users WHERE user_id = ?', (curator_id,))
+            curator_data = db.cursor.fetchone()
+            if curator_data and curator_data[0]:
+                curator_name = curator_data[0]
+
+        # Общее количество
+        total_scammers = max(scammers_count or 0, real_scammers or 0, by_name or 0)
+
+        # Получаем последние заносы
+        db.cursor.execute('''
+            SELECT scammer_id, reason, added_date 
+            FROM scammers 
+            WHERE reporter_id = ? OR reported_by LIKE '%' || ? || '%'
+            ORDER BY added_date DESC 
+            LIMIT 5
+        ''', (user_id, username or str(user_id)))
+
+        last_scams = db.cursor.fetchall()
+
+        # Формируем текст
+        text = f"""👨‍🎓 **СТАТИСТИКА СТАЖЁРА**
+━━━━━━━━━━━━━━━━━━━━
+[⠀](https://i.ibb.co/fjNVRVw/photo-2025-04-17-17-44-20-4.jpg)
+
+**👤 Имя:** {display_name}
+**🆔 ID:** `{user_id}`
+
+📊 **ПОКАЗАТЕЛИ:**
+• 🔪 Слито скамеров: `{total_scammers}`
+• 📝 В поле scammers_count: `{scammers_count or 0}`
+• 🎯 Реально занесено: `{real_scammers or 0}`
+• 🔍 Проверок: `{check_count or 0}`
+• ⚠️ Выговоры: `{warnings or 0}`
+• 👨‍🏫 Куратор: {curator_name}
+
+"""
+
+        if last_scams:
+            text += "📋 **ПОСЛЕДНИЕ ЗАНОСЫ:**\n"
+            for scam_id, reason, date in last_scams:
+                # Форматируем дату
+                try:
+                    date_str = date[:10] if date else "Неизвестно"
+                except:
+                    date_str = "Неизвестно"
+
+                # Сокращаем причину
+                short_reason = reason[:30] + "..." if len(reason) > 30 else reason
+                text += f"• `{scam_id}` - {short_reason} ({date_str})\n"
+
+        text += """
+━━━━━━━━━━━━━━━━━━━━
+🎯 **СОВЕТЫ ДЛЯ РОСТА:**
+• Активно ищите скамеров в чатах
+• Всегда предоставляйте пруфы
+• Следуйте инструкциям куратора
+• Избегайте выговоров
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+
+        # Кнопки
+        buttons = [
+            [Button.inline("🔄 Обновить", f"trainee_stats_{trainee_id}")],
+            [Button.inline("🏆 Назад к топу", b"top_trainees")],
+            [Button.inline("📊 Общая статистика", b"return_to_stats")],
+            [Button.inline("👤 Профиль", f"check_{trainee_id}")]
+        ]
+
+        await event.edit(text, buttons=buttons, parse_mode='md', link_preview=True)
+
+    except Exception as e:
+        logging.error(f"Ошибка в trainee_stats_handler: {e}")
+        await event.answer("❌ Ошибка загрузки", alert=True)
+
+
+# Глобальная переменная для хранения ID последнего сообщения с топом
+last_top_message = {}
+
+
+@bot.on(events.CallbackQuery(data=b"top_trainees"))
+async def top_trainees_handler(event):
+    """Топ стажеров по слитым скамерам с защитой от дублирования"""
+    user_id = event.sender_id
+    chat_id = event.chat_id
+
+    try:
+        # Проверяем, не обрабатывается ли уже запрос
+        if user_id in last_top_message and time.time() - last_top_message[user_id].get('timestamp', 0) < 2:
+            await event.answer("⏳ Подождите, загрузка уже идет...", alert=False)
+            return
+
+        # Сохраняем время запроса
+        last_top_message[user_id] = {
+            'timestamp': time.time(),
+            'chat_id': chat_id
+        }
+
+        # Удаляем предыдущее сообщение если оно есть в этом же чате
+        if user_id in last_top_message and 'message_id' in last_top_message[user_id]:
+            try:
+                await bot.delete_messages(chat_id, last_top_message[user_id]['message_id'])
+            except:
+                pass
+
+        # Удаляем сообщение с кнопкой (если возможно)
+        try:
+            await event.delete()
+        except:
+            pass
+
+        # Получаем топ стажеров
         top_trainees = db.cursor.execute('''
-            SELECT user_id, username, scammers_slept 
-            FROM users 
-            WHERE role_id = 6 
-            ORDER BY scammers_slept DESC 
-            LIMIT 10
+            SELECT u.user_id, u.username, u.scammers_count, 
+                   u.check_count, u.warnings,
+                   (SELECT COUNT(*) FROM scammers WHERE reporter_id = u.user_id) as real_scammers
+            FROM users u 
+            WHERE u.role_id = 6 
+            ORDER BY COALESCE(scammers_count, 0) DESC 
+            LIMIT 15
         ''').fetchall()
 
         if not top_trainees:
-            msg = await event.respond("📭 Список стажеров пока пуст!",
-                                      buttons=Button.inline("↩Вернуться", b"return_to_stats"))
-            bot.last_message_id = msg.id
+            text = """🏆 **ТОП СТАЖЁРОВ**
+━━━━━━━━━━━━━━━━━━━━
+[⠀](https://i.ibb.co/fjNVRVw/photo-2025-04-17-17-44-20-4.jpg)
+
+📭 **Список стажёров пока пуст!**
+
+👨‍🎓 Станьте первым в этом топе!
+🔪 Заносите скамеров через /скам
+🎯 Получайте +спасибо от персонала
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+            buttons = [
+                [Button.inline("🔄 Обновить", b"top_trainees")],
+                [Button.inline("📊 Назад к статистике", b"return_to_stats")],
+                [Button.url("📚 Как стать стажёром?", "https://t.me/Infinityantiscam")]
+            ]
+
+            msg = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
+            last_top_message[user_id]['message_id'] = msg.id
             return
 
-        response = "🏆 Топ 10 стажеров по слитым скаммерам:\n\n"
-        for i, (user_id, username, count) in enumerate(top_trainees, 1):
-            # Используем username или user_id, если username отсутствует
-            user_link = f"[{username or f'ID:{user_id}'}](tg://user?id={user_id})"
-            response += f"{i}. {user_link} — 🚫 {count} скаммеров\n"
+        # Формируем текст
+        text = f"""🏆 **ТОП-{len(top_trainees)} СТАЖЁРОВ**
+━━━━━━━━━━━━━━━━━━━━
+[⠀](https://i.ibb.co/fjNVRVw/photo-2025-04-17-17-44-20-4.jpg)
 
-        msg = await event.respond(response,
-                                  parse_mode='Markdown',
-                                  buttons=Button.inline("↩Вернуться", b"return_to_stats"))
-        bot.last_message_id = msg.id
+👑 **Топ по количеству слитых скамеров:**
+━━━━━━━━━━━━━━━━━━━━
+"""
+
+        buttons = []
+
+        for i, (user_id_trainee, username, scammers_count, check_count, warnings, real_scammers) in enumerate(
+                top_trainees, 1):
+            if i == 1:
+                medal = "🥇"
+            elif i == 2:
+                medal = "🥈"
+            elif i == 3:
+                medal = "🥉"
+            else:
+                medal = f"{i}."
+
+            display_name = f"@{username}" if username else f"ID:{user_id_trainee}"
+            if len(display_name) > 20:
+                display_name = display_name[:17] + "..."
+
+            final_count = max(scammers_count or 0, real_scammers or 0)
+            text += f"{medal} **{display_name}** - `{final_count}`🔪\n"
+
+            if i <= 5:
+                if final_count >= 50:
+                    knife_emoji = "🔪🔪🔪"
+                elif final_count >= 20:
+                    knife_emoji = "🔪🔪"
+                elif final_count >= 10:
+                    knife_emoji = "🔪"
+                else:
+                    knife_emoji = "🗡️"
+
+                button_text = f"{medal} {display_name} {final_count}{knife_emoji}"
+                if len(button_text) > 25:
+                    display_short = display_name[:10] + ".." if len(display_name) > 10 else display_name
+                    button_text = f"{medal} {display_short} {final_count}{knife_emoji}"
+
+                buttons.append([Button.inline(button_text, f"trainee_stats_{user_id_trainee}")])
+
+        # Статистика
+        total_scammers = sum(max(row[2] or 0, row[5] or 0) for row in top_trainees)
+        avg_scammers = total_scammers / len(top_trainees) if top_trainees else 0
+
+        text += f"""
+━━━━━━━━━━━━━━━━━━━━
+📊 **СТАТИСТИКА ТОПА:**
+• Всего скамеров в топе: `{total_scammers}`
+• В среднем на стажёра: `{avg_scammers:.1f}`
+• Стажёров в топе: `{len(top_trainees)}`
+
+🎯 **Как попасть в топ?**
+• Активно заносите скамеров через /скам
+• Получайте +спасибо от персонала
+• Не получайте выговоров
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+
+        # Кнопки
+        nav_buttons = [
+            [Button.inline("🔄 Обновить", b"top_trainees")],
+            [Button.inline("📊 Общая статистика", b"return_to_stats")],
+            [Button.inline("🏅 Топ Админов", b"top_admins")]
+        ]
+
+        if buttons:
+            paired_buttons = []
+            for i in range(0, len(buttons), 2):
+                if i + 1 < len(buttons):
+                    paired_buttons.append([buttons[i][0], buttons[i + 1][0]])
+                else:
+                    paired_buttons.append([buttons[i][0]])
+
+            for nav_row in nav_buttons:
+                paired_buttons.append(nav_row)
+
+            buttons = paired_buttons
+        else:
+            buttons = nav_buttons
+
+        buttons.append([Button.url("👨‍🎓 Чат стажёров", "https://t.me/Infinityantiscam")])
+
+        # Отправляем ОДНО сообщение
+        msg = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
+
+        # Сохраняем ID сообщения
+        last_top_message[user_id]['message_id'] = msg.id
+
+        # Отвечаем на callback чтобы убрать "часики"
+        await event.answer()
 
     except Exception as e:
-        await event.respond(f"⚠️ Ошибка: {str(e)}", buttons=Button.inline("↩Вернуться", b"return_to_stats"))
-    finally:
-        db.close()
+        logging.error(f"Ошибка в top_trainees_handler: {e}")
+        await event.answer("❌ Ошибка загрузки", alert=True)
 
 
 @bot.on(events.CallbackQuery(data=b"return_to_stats"))
 async def return_to_stats_handler(event):
+    """Вернуться к статистике с защитой от дублирования"""
+    user_id = event.sender_id
+    chat_id = event.chat_id
+
     try:
-        # Удаляем сообщение с топом стажёров
-        await bot.delete_messages(event.chat_id, event.message_id)
+        # Защита от быстрых кликов
+        if user_id in last_top_message and time.time() - last_top_message[user_id].get('timestamp', 0) < 2:
+            await event.answer("⏳ Подождите...", alert=False)
+            return
 
-        # Возвращаем пользователя к сообщению со статистикой
-        user = await event.get_sender()
-
-        # Основные статистические данные
-        total_checks = db.cursor.execute('SELECT SUM(check_count) FROM users').fetchone()[0] or 0
-        scammers_count = db.cursor.execute('SELECT COUNT(*) FROM scammers').fetchone()[0]
-        total_users = db.cursor.execute('SELECT COUNT(*) FROM users').fetchone()[0]
-
-        # Статистика по ролям
-        roles_stats = {
-            'admins': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 7').fetchone()[0],
-            'guarantors': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 1').fetchone()[0],
-            'verified': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 12').fetchone()[0],
-            'trainees': db.cursor.execute('SELECT COUNT(*) FROM users WHERE role_id = 6').fetchone()[0]
+        last_top_message[user_id] = {
+            'timestamp': time.time(),
+            'chat_id': chat_id
         }
 
-        # Формируем сообщение со статистикой
-        text = f"""🔍 {user.first_name}, вот текущая статистика бота:
-[⠀](https://i.ibb.co/Fzpqd0K/IMG-3735.jpg)
-🚫 Скаммеров в базе: {scammers_count}
-👥 Пользователей бота: {total_users}
+        # Удаляем текущее сообщение
+        try:
+            await event.delete()
+        except:
+            pass
 
-⚖️ Админов: {roles_stats['admins']}
-💎 Гарантов: {roles_stats['guarantors']}
-✅ Проверенных: {roles_stats['verified']}
-👨‍🎓 Стажеров: {roles_stats['trainees']}
+        # Удаляем предыдущее сообщение топа если есть
+        if user_id in last_top_message and 'message_id' in last_top_message[user_id]:
+            try:
+                await bot.delete_messages(chat_id, last_top_message[user_id]['message_id'])
+                del last_top_message[user_id]['message_id']
+            except:
+                pass
 
-🔎 Всего проверок: {total_checks}
-⏳ Последняя проверка: {datetime.now().strftime('%d.%m.%Y %H:%M')}
-"""
+        # Вызываем статистику через имитацию события
+        from telethon import events
 
-        # Создаем кнопки
-        buttons = [
-            [Button.inline("🏆 Топ Стажеров", b"top_trainees")],
-            [Button.inline("😎 Топ Активных", b"top_day")]
-        ]
+        # Создаем фейковое событие
+        class FakeEvent:
+            def __init__(self):
+                self.is_private = True
+                self.sender_id = user_id
+                self.chat_id = chat_id
+                self._respond_called = False
 
-        stat_message = await event.respond(text, parse_mode='md', link_preview=True, buttons=buttons)
-        bot.stat_message_id = stat_message.id
+            async def respond(self, *args, **kwargs):
+                if not self._respond_called:
+                    self._respond_called = True
+                    msg = await event.respond(*args, **kwargs)
+                    last_top_message[user_id]['message_id'] = msg.id
+                    return msg
+
+        fake_event = FakeEvent()
+        await statistics(fake_event)
+
+        await event.answer()
 
     except Exception as e:
-        await event.respond(f"⚠️ Ошибка: {str(e)}")
-    finally:
-        db.close()
+        logging.error(f"Ошибка в return_to_stats_handler: {e}")
+        await event.answer("❌ Ошибка", alert=True)
+
+
+# Функция для периодической очистки
+async def cleanup_old_messages():
+    """Очищает старые записи о сообщениях"""
+    while True:
+        await asyncio.sleep(3600)  # Каждый час
+        current_time = time.time()
+        to_remove = []
+
+        for user_id, data in last_top_message.items():
+            if current_time - data.get('timestamp', 0) > 7200:  # 2 часа
+                to_remove.append(user_id)
+
+        for user_id in to_remove:
+            del last_top_message[user_id]
+
+        if to_remove:
+            logging.info(f"Очищено {len(to_remove)} старых записей сообщений")
+
+
+# Добавьте в main() перед запуском бота:
+bot.loop.create_task(cleanup_old_messages())
+
+
 
 
 @bot.on(events.CallbackQuery(data=b"top_day"))
@@ -6328,6 +7065,13 @@ async def broadcast_status(event):
         f"• `/broadcaststatus` - текущий статус"
     )
 
+def shutdown_handler(signal, frame):
+    """Обработчик завершения работы бота"""
+    logging.info("Завершение работы бота...")
+    db.close()  # ТОЛЬКО ЗДЕСЬ закрываем БД
+    sys.exit(0)
+
+
 def main():
     print("Bot started...")
     bot.loop.create_task(cleanup_old_button_data())
@@ -6340,6 +7084,9 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
     logger = logging.getLogger(__name__)
+
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
 
     logger.info("Бот запущен и готов к работе.")
     bot.run_until_disconnected()
