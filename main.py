@@ -959,12 +959,10 @@ class Database:
             return "Ошибка базы данных"
 
     def update_role(self, user_id, role_id, granted_by_id=None):
+        """Обновляет роль пользователя"""
         try:
-            # Сначала проверяем, есть ли пользователь в базе
-            if not self.is_user_in_db(user_id):
-                self.add_user(user_id, "", role_id)
-            else:
-                self.cursor.execute('UPDATE users SET role_id = ? WHERE user_id = ?', (role_id, user_id))
+            # Обновляем роль
+            self.cursor.execute('UPDATE users SET role_id = ? WHERE user_id = ?', (role_id, user_id))
 
             if granted_by_id is not None:
                 self.cursor.execute('UPDATE users SET granted_by_id = ? WHERE user_id = ?', (granted_by_id, user_id))
@@ -1351,16 +1349,16 @@ ROLES = {
     11: {"name": "Кодер 💻", "preview_url": "https://i.ibb.co/pjYvHgP2/IMG-20250830-171539-780.jpg", "scam_chance": 3},
     12: {"name": "Проверен гарантом ✅", "preview_url": "https://imgfy.ru/ib/fDocPi2gjwsztYh_1768319365.jpg",
          "scam_chance": 5},
-    13: {"name": "Айдош⭐", "preview_url": "https://i.ibb.co/xtQPhT16/image.jpg", "scam_chance": 20}
+    13: {"name": "сын шлюхи⭐", "preview_url": "", "scam_chance": 50}
 }
 
 # Добавьте в начало файла после ROLES:
 
 # Все роли персонала базы (кто защищен от заноса)
-STAFF_ROLES = [1, 6, 7, 8, 9, 10, 11, 12, 13]  # Все персоналы + гаранты
+STAFF_ROLES = [1, 6, 7, 8, 9, 10, 11, 12]  # Все персоналы + гаранты
 
 # Роли, которым разрешено заносить (все персоналы кроме некоторых)
-CAN_ADD_SCAMMER_ROLES = [1, 6, 7, 8, 9, 10, 11, 13]  # Все могут заносить, но...
+CAN_ADD_SCAMMER_ROLES = [1, 6, 7, 8, 9, 10, 11]  # Все могут заносить, но...
 # 12 (Проверен гарантом) не может заносить
 
 async def check_user(event):
@@ -3575,9 +3573,17 @@ async def delete_message(event):
     else:
         await event.reply("❌ Пожалуйста, ответьте на сообщение, которое хотите удалить.")
 
+@bot.on(events.NewMessage)
+async def debug_all_messages(event):
+    if event.sender_id == 262511724:  # Только ваши сообщения
+        logging.info(f"DEBUG: Получено сообщение от {event.sender_id}: {event.raw_text}")
 
-@bot.on(events.NewMessage(pattern=r'[+-](?:[А-Яа-я]+)(?:\s+(?:@?\w+|\d+))?'))
+@bot.on(events.NewMessage(pattern=r'[+-](?:[А-Яа-яёЁ]+)(?:\s+(?:@?\w+|\d+))?'))
 async def handle_role_command(event):
+    logging.info(f"=== ПОПЫТКА ОБРАБОТКИ КОМАНДЫ РОЛИ ===")
+    logging.info(f"Сообщение: {event.raw_text}")
+    logging.info(f"Отправитель ID: {event.sender_id}")
+
     user_role = db.get_user_role(event.sender_id)
     is_admin = event.sender_id in [262511724] or user_role == 10
 
@@ -3623,10 +3629,14 @@ async def handle_role_command(event):
         'гарант': 1,
         'кодер': 11,
         'владелец': 10,
-        'айдош': 13
+        'айдош': 13,
+        'создатель': 10
     }
 
     current_role = db.get_user_role(user.id)
+
+    # Проверяем, есть ли пользователь в базе
+    user_exists = db.get_user(user.id) is not None
 
     if action == '+':
         # Проверка для президента
@@ -3636,10 +3646,12 @@ async def handle_role_command(event):
             bot.last_message_id = msg.id
             return
 
-        # Специальные права для ID 5399940308 и 808428464
-        # Специальные права для выдачи ролей создателя и кодера
-        if event.sender_id in [262511724] and role in ['кодер', 'создатель']:
-            db.add_user(user.id, user.username)
+        # Специальные права для ID 262511724 (владение)
+        if event.sender_id in [262511724] and role in ['кодер', 'создатель', 'владелец']:
+            # Добавляем пользователя если его нет
+            if not user_exists:
+                db.add_user(user.id, user.username)
+            # Обновляем роль
             db.update_role(user.id, role_mapping[role])
             msg = await event.reply(
                 f"✅ Роль {role} выдана пользователю [{user.first_name}](tg://user?id={user.id})",
@@ -3647,21 +3659,24 @@ async def handle_role_command(event):
             bot.last_message_id = msg.id
             return
 
-        # Обычная выдача ролей
-        if current_role in [1]:
-            db.add_user(user.id, user.username)
+        # Обычная выдача ролей - проверяем что у пользователя роль 0 (нет в базе)
+        if current_role == 0 or not user_exists:
+            # Добавляем пользователя если его нет
+            if not user_exists:
+                db.add_user(user.id, user.username)
+            # Обновляем роль
             db.update_role(user.id, role_mapping[role])
             msg = await event.reply(
                 f"✅ Роль {role} выдана пользователю [{user.first_name}](tg://user?id={user.id})",
                 buttons=Button.inline("↩Скрыть", b"hide_message"))
             bot.last_message_id = msg.id
         else:
-            msg = await event.reply("❌ Нельзя выдавать роль пользователю, который уже имеет роль.",
+            msg = await event.reply("❌ У пользователя уже есть роль.",
                                     buttons=Button.inline("↩Скрыть", b"hide_message"))
             bot.last_message_id = msg.id
-    else:
+    else:  # action == '-'
         # Снятие ролей
-        # Снятие роли создателя
+        # Снятие роли создателя/владельца
         if current_role == 10 and event.sender_id in [262511724]:
             db.update_role(user.id, 0)
             msg = await event.reply(
